@@ -1,0 +1,17 @@
+{
+  "name": "passerjack",
+  "owner": {
+    "name": "Jack Neil"
+  },
+  "metadata": {
+    "description": "Claude Code plugins for PasserJack, the cross-device snippet relay."
+  },
+  "plugins": [
+    {
+      "name": "passerjack",
+      "source": "./plugins/passerjack",
+      "description": "Watch PasserJack for the whole session: tagged items and messages wake the session as they arrive.",
+      "version": "0.1.0"
+    }
+  ]
+}
