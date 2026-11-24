@@ -16,9 +16,19 @@
  * process re-arms itself, carrying the goodbye's cursor as `Last-Event-ID`, so
  * the session only ever wakes for something that arrived.
  *
- * Configuration is environment only; see `readConfig`. The key goes into one
- * request header and nowhere else: never printed, never logged, never on a
- * command line.
+ * THE CREDENTIAL. `PASSERJACK_API_KEY` from the environment wins when it is
+ * set (see `readConfig`). Otherwise the credentials file that
+ * `/passerjack:connect` writes (`credentials.mjs`): a browser sign-in, whose
+ * access token this process refreshes before it expires and on a 401, under a
+ * lock shared by every session on the machine, or a key saved with `--paste`.
+ * With neither, it prints ONE waiting line and checks the file every three
+ * seconds, so a sign-in made after Claude Code started reaches this session
+ * with no restart. A sign-in the server refuses prints ONE stopped line and
+ * the watch waits again. WHILE it watches it keeps checking the file the same
+ * way: a sign-out stops the watch with no line (the person did it on
+ * purpose), and a new sign-in (another account, or a pasted key) restarts the
+ * watch on it. The key or token goes into one request header and nowhere
+ * else: never printed, never logged, never on a command line.
  *
  * PRESENCE. At start it registers this session (`POST /api/sessions`: host,
  * the working directory's last segment, the repo's `owner/name`, the branch)
@@ -33,7 +43,19 @@
 
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import os from "node:os";
+import {
+  bearerOf,
+  credentialsPath,
+  fingerprint,
+  needsRefresh,
+  readCredentials,
+  renewCredential,
+  requestRefresh,
+  sameSignIn,
+} from "./credentials.mjs";
+import { findOnPath, safeCwd } from "./programs.mjs";
 import {
   BurstWindow,
   IDLE_TIMEOUT_MS,
@@ -42,8 +64,11 @@ import {
   MIN_HEALTHY_LIFETIME_MS,
   NO_SESSION_LINE,
   OutageMemo,
+  SAVED_KEY_REFUSED_LINE,
+  SIGN_IN_EXPIRED_LINE,
   SseParser,
   TOO_MANY_WATCHERS_WAIT_MS,
+  WAITING_FOR_SIGN_IN_LINE,
   backoffMs,
   burstLineFor,
   feedUrl,
@@ -56,13 +81,28 @@ import {
   sessionIdFrom,
 } from "./watch-core.mjs";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 function print(line) {
   process.stdout.write(`${line}\n`);
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+/** A sleep that ends early when `signal` aborts (the credential died). */
+function sleep(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+/** How often the waiting watcher looks at the credentials file: one `stat`. */
+const SIGN_IN_POLL_MS = 3000;
 
 /** Statuses asking again will never fix: say so once and stop that lane. */
 const PERMANENT = new Set([400, 403, 404]);
@@ -80,36 +120,222 @@ const END_TIMEOUT_MS = 2000;
  */
 const FRESH_MS = 10_000;
 
-function requestHeaders(config) {
+function requestHeaders(token) {
   return {
-    authorization: `Bearer ${config.key}`,
+    authorization: `Bearer ${token}`,
     "user-agent": `passerjack-claude-plugin/${VERSION}`,
   };
+}
+
+/**
+ * A key from `PASSERJACK_API_KEY`. It cannot be renewed, and a 401 on it keeps
+ * the behaviour it always had: say so once and exit (`stopOnDeadKey`).
+ */
+class EnvAuth {
+  constructor(key) {
+    this.key = key;
+    this.kind = "env";
+    this.dead = false;
+    this.stopReason = null;
+    this.signal = new AbortController().signal;
+    this.inFlight = null;
+  }
+
+  get stopped() {
+    return false;
+  }
+
+  async bearer() {
+    return this.key;
+  }
+
+  token() {
+    return this.key;
+  }
+
+  async recover() {
+    return "dead";
+  }
+
+  stop() {}
+}
+
+/**
+ * A credential from the credentials file. ONE recovery runs at a time in this
+ * process (every lane and the registration can hit the same 401 together),
+ * and `refreshUnderLock` makes it one per MACHINE: it re-reads the file under
+ * the lock, so a token another session already refreshed is used rather than
+ * spending the refresh token a second time, which the server would read as a
+ * replay outside its grace window.
+ *
+ * The watch on this credential STOPS (`signal` aborts, every lane drops what
+ * it is doing) for one of three reasons, in `stopReason`:
+ *   - `refused`: the server refused the credential. `main` prints one line
+ *     and waits for a different one.
+ *   - `signed-out`: the file is gone, or now names another origin. A person
+ *     did that on purpose, so nothing is printed, and the watch waits.
+ *   - `replaced`: the file holds a NEW sign-in (another `connection` id, or
+ *     another key). The watch starts again on it, with a new presence
+ *     `clientId`, because it may be another account.
+ * A token that another session rotated is the SAME sign-in (`sameSignIn`),
+ * and is taken over in place with no stop.
+ */
+class FileAuth {
+  constructor(file, cred) {
+    this.file = file;
+    this.cred = cred;
+    this.kind = cred.kind;
+    this.dead = false;
+    this.stopReason = null;
+    this.controller = new AbortController();
+    this.signal = this.controller.signal;
+    this.inFlight = null;
+    /** A rotated pair that the file could not take: see `refreshUnderLock`. */
+    this.unsaved = null;
+    this.fileTimer = null;
+    this.fileStamp = statStamp(file);
+  }
+
+  get stopped() {
+    return this.stopReason !== null;
+  }
+
+  token() {
+    return bearerOf(this.cred);
+  }
+
+  /** The token to send, refreshed first when it has less than a few minutes left. */
+  async bearer() {
+    if (!this.stopped && needsRefresh(this.cred)) await this.recover(this.token());
+    return this.token();
+  }
+
+  /**
+   * `usedToken` was refused (or is due). Answers `ok` (use `token()` now),
+   * `transient` (try again later; the network or the lock) or `dead`.
+   */
+  recover(usedToken) {
+    if (this.stopped) return Promise.resolve("dead");
+    if (this.token() !== usedToken) return Promise.resolve("ok");
+    this.inFlight ??= this.renew(usedToken).finally(() => {
+      this.inFlight = null;
+    });
+    return this.inFlight;
+  }
+
+  async renew(usedToken) {
+    const out = await renewCredential(this.file, {
+      staleToken: usedToken,
+      refresh: (cred) => requestRefresh(cred),
+      unsaved: this.unsaved,
+    });
+    if (this.stopped) return "dead";
+    if (out.kind === "transient") return "transient";
+    if (out.kind === "ok") {
+      if (!sameSignIn(this.cred, out.cred)) {
+        this.stop("replaced");
+        return "dead";
+      }
+      // `replaces` is what the FILE holds, which after two failed saves is
+      // older than the pair this process held before.
+      this.unsaved = out.saved === false ? { cred: out.cred, replaces: out.replaces } : null;
+      this.cred = out.cred;
+      this.fileStamp = statStamp(this.file);
+      return "ok";
+    }
+    if (out.kind === "gone") {
+      this.stop("signed-out");
+      return "dead";
+    }
+    this.dead = true;
+    this.stop("refused");
+    return "dead";
+  }
+
+  stop(reason) {
+    if (this.stopReason !== null) return;
+    this.stopReason = reason;
+    this.unwatchFile();
+    this.controller.abort();
+  }
+
+  /**
+   * While the watch runs, one `stat` of the file every few seconds, the same
+   * check `waitForSignIn` makes. Nothing else would ever see a sign-out or a
+   * new sign-in: a pasted key never comes due, and a browser sign-in only
+   * looks at the file when it refreshes, up to an hour later.
+   */
+  watchFile(origin) {
+    this.fileTimer = setInterval(() => {
+      const stamp = statStamp(this.file);
+      if (stamp === this.fileStamp) return;
+      this.fileStamp = stamp;
+      const cred = stamp === "missing" ? null : readCredentials(this.file);
+      if (!cred || cred.origin !== origin) {
+        this.stop("signed-out");
+      } else if (!sameSignIn(this.cred, cred)) {
+        this.stop("replaced");
+      } else if (fingerprint(cred) !== fingerprint(this.cred) && !this.unsaved) {
+        // Another session rotated the pair: take it over in place.
+        this.cred = cred;
+      }
+    }, SIGN_IN_POLL_MS);
+    this.fileTimer.unref?.();
+  }
+
+  unwatchFile() {
+    if (this.fileTimer) clearInterval(this.fileTimer);
+    this.fileTimer = null;
+  }
+}
+
+/** One `stat` of the file, as a stamp that changes when the file does. */
+function statStamp(file) {
+  try {
+    const stat = fs.statSync(file);
+    return `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+  } catch {
+    return "missing";
+  }
 }
 
 /**
  * One fact from git, or null on any failure (no git, not a repository, no
  * remote, a timeout). An argv array and no shell, so nothing in a directory
  * name or a remote is ever interpreted.
+ *
+ * `git` is started by its ABSOLUTE path from an absolute PATH entry, never by
+ * a bare name: on Windows a bare name is looked for in the current folder
+ * first, which is the project, so a `git.exe` in a cloned repository would
+ * run (`programs.mjs`). The project is named with `-C`, and on Windows the
+ * child starts in System32.
  */
-function git(args) {
+function git(gitPath, args) {
   return new Promise((resolve) => {
-    execFile("git", args, { timeout: 2000, windowsHide: true, encoding: "utf8" }, (err, stdout) => {
-      if (err) return resolve(null);
-      const out = String(stdout ?? "").trim();
-      resolve(out || null);
-    });
+    if (!gitPath) return resolve(null);
+    execFile(
+      gitPath,
+      ["-C", process.cwd(), ...args],
+      { timeout: 2000, windowsHide: true, encoding: "utf8", cwd: safeCwd(process.platform, process.env) },
+      (err, stdout) => {
+        if (err) return resolve(null);
+        const out = String(stdout ?? "").trim();
+        resolve(out || null);
+      },
+    );
   });
 }
 
 async function gatherFacts() {
+  const gitPath = findOnPath("git", { env: process.env, platform: process.platform });
   const [remote, branch] = await Promise.all([
-    git(["remote", "get-url", "origin"]),
-    git(["rev-parse", "--abbrev-ref", "HEAD"]),
+    git(gitPath, ["remote", "get-url", "origin"]),
+    git(gitPath, ["rev-parse", "--abbrev-ref", "HEAD"]),
   ]);
   // Raw here and reduced by `sessionBody` before anything is sent: the full
-  // directory and the remote URL (which may carry a token) never leave.
-  return { hostname: os.hostname(), cwd: process.cwd(), remote, branch, clientId: randomUUID() };
+  // directory and the remote URL (which may carry a token) never leave. The
+  // presence `clientId` is NOT here: each watch makes its own (`watchWith`).
+  return { hostname: os.hostname(), cwd: process.cwd(), remote, branch };
 }
 
 /**
@@ -119,8 +345,9 @@ async function gatherFacts() {
  * eviction or the sweep took the old row), never on a same-id re-registration.
  */
 class Presence {
-  constructor(config, body) {
+  constructor(config, auth, body) {
     this.config = config;
+    this.auth = auth;
     this.body = body;
     this.id = null;
     this.confirmedAt = 0;
@@ -151,12 +378,13 @@ class Presence {
   }
 
   /** Answers `ok`, `unreachable`, `refused-401` or `refused-other`; see `lastOutcome`. */
-  async post() {
+  async post(renewed = false) {
     let res;
+    const token = await this.auth.bearer();
     try {
       res = await fetch(new URL("/api/sessions", this.config.origin), {
         method: "POST",
-        headers: { ...requestHeaders(this.config), "content-type": "application/json" },
+        headers: { ...requestHeaders(token), "content-type": "application/json" },
         body: JSON.stringify(this.body),
         redirect: "error",
         signal: AbortSignal.timeout(REGISTER_TIMEOUT_MS),
@@ -165,6 +393,14 @@ class Presence {
       // Unreachable. Keep whatever id we had: the row outlives a blip, and the
       // feed that fails alongside will ask again on its next attempt.
       return "unreachable";
+    }
+    if (res.status === 401 && this.auth.kind !== "env") {
+      // A token that expired or was rotated by another session: renew it and
+      // ask once more. A renewal that cannot happen yet is a transient.
+      await res.body?.cancel().catch(() => {});
+      const recovered = await this.auth.recover(token);
+      if (recovered === "ok" && !renewed) return this.post(true);
+      return recovered === "dead" ? "refused-401" : "unreachable";
     }
     let answer = null;
     try {
@@ -223,11 +459,11 @@ class Presence {
     const id = this.id;
     this.disabled = true;
     this.id = null;
-    if (!id) return;
+    if (!id || this.auth.dead) return;
     try {
       await fetch(new URL(`/api/sessions/${id}`, this.config.origin), {
         method: "DELETE",
-        headers: requestHeaders(this.config),
+        headers: requestHeaders(this.auth.token()),
         redirect: "error",
         signal: AbortSignal.timeout(END_TIMEOUT_MS),
       });
@@ -248,8 +484,11 @@ class Presence {
  * `onOpen` fires once the server has answered with a stream, which is what
  * counts as "back online".
  */
-async function connect(config, lane, state, onOpen, sessionId) {
+async function connect(config, auth, lane, state, onOpen, sessionId) {
   const controller = new AbortController();
+  // A dead credential ends every open feed at once.
+  const onDead = () => controller.abort();
+  auth.signal.addEventListener("abort", onDead, { once: true });
   let idle = setTimeout(() => controller.abort(), IDLE_TIMEOUT_MS);
   const touch = () => {
     clearTimeout(idle);
@@ -258,16 +497,26 @@ async function connect(config, lane, state, onOpen, sessionId) {
   const started = Date.now();
   let openedAt = null;
   try {
-    const headers = { accept: "text/event-stream", ...requestHeaders(config) };
-    const cursor = resumeHeader(state.lastEventId);
-    if (cursor !== null) headers["last-event-id"] = cursor;
-    // `redirect: "error"`: a redirect is never followed with a bearer key on it.
-    const res = await fetch(feedUrl(config.origin, lane, sessionId), {
-      headers,
-      signal: controller.signal,
-      redirect: "error",
-    });
-    if (res.status === 401) return { kind: "unauthorized" };
+    let res;
+    for (let attempt = 0; ; attempt += 1) {
+      const token = await auth.bearer();
+      const headers = { accept: "text/event-stream", ...requestHeaders(token) };
+      const cursor = resumeHeader(state.lastEventId);
+      if (cursor !== null) headers["last-event-id"] = cursor;
+      // `redirect: "error"`: a redirect is never followed with a bearer key on it.
+      res = await fetch(feedUrl(config.origin, lane, sessionId), {
+        headers,
+        signal: controller.signal,
+        redirect: "error",
+      });
+      if (res.status !== 401) break;
+      await res.body?.cancel().catch(() => {});
+      // An expired or rotated token is renewed and the feed asked ONCE more;
+      // a key from the environment cannot be, and is a dead key at once.
+      const recovered = await auth.recover(token);
+      if (recovered === "dead") return { kind: "unauthorized" };
+      if (recovered !== "ok" || attempt >= 1) return { kind: "failed" };
+    }
     if (res.status === 429) return { kind: "busy" };
     if (PERMANENT.has(res.status)) {
       return { kind: "stopped", status: res.status, body: await res.text().catch(() => "") };
@@ -317,6 +566,7 @@ async function connect(config, lane, state, onOpen, sessionId) {
     return { kind: "failed", healthy };
   } finally {
     clearTimeout(idle);
+    auth.signal.removeEventListener("abort", onDead);
   }
 }
 
@@ -332,31 +582,35 @@ function stopOnDeadKey() {
 }
 
 /**
- * One lane's reconnect loop. Resolves when the lane stops for good. `onlyLane`
- * says no other lane is running, which matters to the nameless message lane:
- * alone, nothing else would ever report a dead key or an outage for it.
+ * One lane's reconnect loop. Resolves when the lane stops for good, or when
+ * the watch on the credential from the file stopped (`auth.stopped`). `onlyLane` says no other
+ * lane is running, which matters to the nameless message lane: alone, nothing
+ * else would ever report a dead key or an outage for it.
  */
-async function runLane(config, lane, outage, presence, onlyLane) {
+async function runLane(config, auth, lane, outage, presence, onlyLane) {
   const state = {
     lastEventId: "",
     burst: new BurstWindow(print, (n) => burstLineFor(lane, n), (fn, ms) => setTimeout(fn, ms).unref()),
   };
+  const wait = (ms) => sleep(ms, auth.signal);
   let attempt = 0;
   for (;;) {
+    if (auth.stopped) return;
     const sessionId = await presence.beforeConnect();
+    if (auth.stopped) return;
     if (lane.kind === "messages" && lane.to === null && !sessionId) {
       // A nameless message lane IS its session (the server rings it for what
       // hinted sends deliver there), so without one it has nothing to ask for
       // and the server would refuse it. What the registration said decides
       // what, if anything, is printed; then wait and try again.
       const outcome = presence.lastOutcome;
-      if (outcome === "refused-401" && onlyLane) return stopOnDeadKey();
+      if (outcome === "refused-401" && onlyLane && auth.kind === "env") return stopOnDeadKey();
       if (outcome === "unreachable") {
         // The one lane that would otherwise sit silent through an outage:
         // feed the same memo a failed connect does, so the offline line can print.
         const line = outage.failed(lane, Date.now());
         if (line) print(line);
-        await sleep(backoffMs(attempt));
+        await wait(backoffMs(attempt));
         attempt += 1;
         continue;
       }
@@ -366,7 +620,7 @@ async function runLane(config, lane, outage, presence, onlyLane) {
         noSessionSaid = true;
         print(NO_SESSION_LINE);
       }
-      await sleep(TOO_MANY_WATCHERS_WAIT_MS);
+      await wait(TOO_MANY_WATCHERS_WAIT_MS);
       continue;
     }
     if (lane.kind === "messages" && lane.to === null) {
@@ -376,6 +630,7 @@ async function runLane(config, lane, outage, presence, onlyLane) {
     }
     const ended = await connect(
       config,
+      auth,
       lane,
       state,
       () => {
@@ -384,6 +639,7 @@ async function runLane(config, lane, outage, presence, onlyLane) {
       },
       sessionId,
     );
+    if (auth.stopped) return;
     if (ended.kind === "stopped" && ended.status === 400 && sessionId) {
       // Possibly the session the feed was asked to carry, not the watch
       // itself: never a reason to stop the lane. See `Presence.refused`.
@@ -391,11 +647,16 @@ async function runLane(config, lane, outage, presence, onlyLane) {
       presence.refused(sessionId);
       // Backed off like any other retry, so a refusal that repeats cannot spin
       // the loop against the server.
-      await sleep(backoffMs(attempt));
+      await wait(backoffMs(attempt));
       attempt += 1;
       continue;
     }
-    if (ended.kind === "unauthorized") return stopOnDeadKey();
+    if (ended.kind === "unauthorized") {
+      // A key from the environment: say so once and exit, as it always did. A
+      // credential from the file is already marked dead, and `watchWith` says so.
+      if (auth.kind === "env") return stopOnDeadKey();
+      return;
+    }
     if (ended.kind === "stopped") {
       // The server answered, so this lane is not offline, and it will never
       // fail or recover again: take it out of the outage memo, or its old
@@ -409,7 +670,7 @@ async function runLane(config, lane, outage, presence, onlyLane) {
     if (ended.kind === "clean" && ended.healthy) {
       // The goodbye, or a drain: straight back, from the cursor it left.
       attempt = 0;
-      if (ended.retryHint) await sleep(ended.retryHint);
+      if (ended.retryHint) await wait(ended.retryHint);
       continue;
     }
     if (ended.kind === "busy") {
@@ -417,15 +678,72 @@ async function runLane(config, lane, outage, presence, onlyLane) {
       // not an outage: wait silently and never feed the offline line.
       outage.answered(lane);
       attempt = 0;
-      await sleep(TOO_MANY_WATCHERS_WAIT_MS);
+      await wait(TOO_MANY_WATCHERS_WAIT_MS);
       continue;
     }
     if (ended.healthy) attempt = 0;
     const line = outage.failed(lane, Date.now());
     if (line) print(line);
-    await sleep(backoffMs(attempt));
+    await wait(backoffMs(attempt));
     attempt += 1;
   }
+}
+
+/**
+ * Wait until the credentials file holds a usable credential for `origin`,
+ * other than the one already refused (`refused`). One `stat` every few
+ * seconds; the file is read again only when the stat changes.
+ */
+async function waitForSignIn(file, origin, refused) {
+  let seen = null;
+  for (;;) {
+    const stamp = statStamp(file);
+    if (stamp !== seen) {
+      seen = stamp;
+      const cred = stamp === "missing" ? null : readCredentials(file);
+      if (cred && cred.origin === origin && fingerprint(cred) !== refused) return cred;
+    }
+    await sleep(SIGN_IN_POLL_MS);
+  }
+}
+
+/**
+ * One watch on one credential: register, run every lane, end the session.
+ * Answers the credential's `stopReason` (`refused`, `signed-out` or
+ * `replaced`) when it stopped, and `stopped` when every lane stopped for good.
+ * Each watch registers with a NEW presence `clientId`: a new sign-in may be
+ * another account, and the server refuses a `clientId` that another account
+ * holds.
+ */
+async function watchWith(config, auth, facts, current) {
+  const presence = new Presence(config, auth, sessionBody(process.env, { ...facts, clientId: randomUUID() }));
+  current.presence = presence;
+  current.auth = auth;
+  if (auth instanceof FileAuth) auth.watchFile(config.origin);
+  try {
+    await presence.register();
+    const outage = new OutageMemo();
+    const onlyLane = config.lanes.length === 1;
+    await Promise.all(config.lanes.map((lane) => runLane(config, auth, lane, outage, presence, onlyLane)));
+    // Every lane stopped: nothing is watching, so nothing is present.
+    await presence.end();
+  } finally {
+    if (auth instanceof FileAuth) auth.unwatchFile();
+  }
+  return auth.stopReason ?? "stopped";
+}
+
+/** Resolve after `promise` or after `ms`, whichever is first. Never rejects. */
+function within(promise, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    Promise.resolve(promise)
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+  });
 }
 
 async function main() {
@@ -434,22 +752,61 @@ async function main() {
     print(config.line);
     return;
   }
-  const presence = new Presence(config, sessionBody(process.env, await gatherFacts()));
+  const facts = await gatherFacts();
+  const current = { presence: null, auth: null };
   let ending = false;
   const stop = () => {
     // A second signal while the first is still ending the session: go now.
     if (ending) process.exit(0);
     ending = true;
-    presence.end().finally(() => process.exit(0));
+    // A refresh in flight is let finish first (bounded): the server may have
+    // rotated the pair already, and an exit before the save would leave the
+    // file with a spent refresh token, which the next refresh, after the
+    // server's 60-second grace, spends as a replay that revokes the
+    // connection.
+    within(current.auth?.inFlight, END_TIMEOUT_MS)
+      .then(() => current.presence?.end())
+      .finally(() => process.exit(0));
   };
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, stop);
 
-  await presence.register();
-  const outage = new OutageMemo();
-  const onlyLane = config.lanes.length === 1;
-  await Promise.all(config.lanes.map((lane) => runLane(config, lane, outage, presence, onlyLane)));
-  // Every lane stopped for good: nothing is watching, so nothing is present.
-  await presence.end();
+  if (config.key) {
+    // The environment wins, and behaves exactly as it always has.
+    await watchWith(config, new EnvAuth(config.key), facts, current);
+    return;
+  }
+
+  // The home folder alone decides the place: no environment variable moves it.
+  const file = credentialsPath();
+  let cred = readCredentials(file);
+  if (!cred || cred.origin !== config.origin) {
+    // ONE line. After a stopped line below, nothing more is printed while it
+    // waits: the person has already been told what to run.
+    print(WAITING_FOR_SIGN_IN_LINE);
+    cred = await waitForSignIn(file, config.origin, null);
+  }
+  for (;;) {
+    const auth = new FileAuth(file, cred);
+    const outcome = await watchWith(config, auth, facts, current);
+    current.presence = null;
+    current.auth = null;
+    if (outcome === "replaced") {
+      // A new sign-in is in the file: start on it, with no line.
+      cred = readCredentials(file) ?? (await waitForSignIn(file, config.origin, null));
+      if (cred.origin !== config.origin) cred = await waitForSignIn(file, config.origin, null);
+      continue;
+    }
+    if (outcome === "signed-out") {
+      // Done on purpose: say nothing, and wait for the next sign-in.
+      cred = await waitForSignIn(file, config.origin, null);
+      continue;
+    }
+    if (outcome !== "refused") return;
+    print(auth.kind === "oauth" ? SIGN_IN_EXPIRED_LINE : SAVED_KEY_REFUSED_LINE);
+    // The refused credential stays in the file until a new sign-in replaces
+    // it, so the wait skips it rather than starting on it again.
+    cred = await waitForSignIn(file, config.origin, fingerprint(auth.cred));
+  }
 }
 
 main().catch((err) => {

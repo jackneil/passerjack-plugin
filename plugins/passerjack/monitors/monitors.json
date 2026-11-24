@@ -2,6 +2,6 @@
   {
     "name": "passerjack-watch",
     "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/watch.mjs\"",
-    "description": "PasserJack inbox: one [passerjack] line when an item tagged for this session (PASSERJACK_WATCH_TAG, default claude) or a message for PASSERJACK_WATCH_NAME arrives. Handle it with the passerjack-inbox skill."
+    "description": "PasserJack inbox: one [passerjack] line when an item tagged for this session (PASSERJACK_WATCH_TAG, default claude) or a message for PASSERJACK_WATCH_NAME arrives. Connect with /passerjack:connect. Handle each line with the passerjack-inbox skill."
   }
 ]

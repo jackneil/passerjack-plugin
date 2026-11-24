@@ -11,11 +11,20 @@ In Claude Code:
 ```
 /plugin marketplace add jackneil/passerjack-plugin
 /plugin install passerjack@passerjack
+/passerjack:connect
 ```
 
-Then set your key (below) and restart Claude Code. The watcher runs as a plugin
-monitor, which Claude Code starts in the background for every interactive
-session. It does not run under `claude -p`.
+The second command opens the plugin details. Choose Install for you (user
+scope). If Claude Code tells you to run `/reload-plugins`, run it before
+`/passerjack:connect`.
+
+The last command opens PasserJack in your browser. Press Connect. The card
+says Unverified app, because the plugin gives itself its name. That is
+correct. The watch then starts in this session within a few seconds. You do
+not edit a shell profile, copy a key or restart Claude Code.
+
+The watcher runs as a plugin monitor, which Claude Code starts in the
+background for every interactive session. It does not run under `claude -p`.
 
 It needs Node 18 or newer on your PATH.
 
@@ -29,29 +38,73 @@ repository, and it is no longer a marketplace:
 /plugin install passerjack@passerjack
 ```
 
+## Connect
+
+`/passerjack:connect` does one of these things:
+
+| Command | What it does |
+| --- | --- |
+| `/passerjack:connect` | Signs in through your browser. It asks for the `read` permission only. |
+| `/passerjack:connect --paste` | Saves an API key from your clipboard. |
+| `/passerjack:connect --paste <file>` | Saves an API key from a file. Use it when the computer has no clipboard. Delete the file after. |
+| `/passerjack:connect --status` | Says if this computer is connected, and to which account. |
+| `/passerjack:connect --sign-out` | Ends the sign-in on the server and deletes the saved file. If the server does not confirm it, the file stays and the line says so. |
+
+To make a key for `--paste`: in Settings > Agents on passerjack.com, open Use
+an API key instead, choose View only, press Create a key and fill this in,
+then press Copy the key. The watch needs View only. The file keeps the key at
+rest, so do not give it more.
+
+### A computer with no browser
+
+Claude Code over SSH, or a server with no desktop, cannot open the sign-in
+page itself. Run `/passerjack:connect` there. Open the address that it shows
+on any computer and press Connect. The page after that does not load, because
+it goes to `127.0.0.1` on the computer with the browser. Copy the full
+address of that page and give it to Claude. Claude sends it to the waiting
+sign-in on the remote computer. The address holds a one-time code that works
+only for that sign-in.
+
+You can also make a key, put it in a file on that computer (for example with
+`scp`), and run `/passerjack:connect --paste <file>`.
+
+### Where the sign-in is saved
+
+The sign-in is saved in one file that only you can read:
+
+- Windows: `AppData\Local\PasserJack\credentials.json` in your user folder.
+  It is not in the roaming profile, because the sign-in belongs to this
+  computer.
+- macOS and Linux: `~/.config/passerjack/credentials.json`
+
+No setting moves this file. A project's Claude Code settings can set
+environment variables, so a setting that moved the file would let a project
+put your sign-in inside itself.
+
+Every Claude Code session on the computer uses the same file. The watcher
+renews the sign-in before it expires. When several sessions renew at the same
+time, a lock lets only one of them renew, and the others read its result. The
+connection shows in Settings > Agents > Connected apps as "PasserJack for
+Claude Code on <your computer>". Disconnect it there to stop it.
+
+A new sign-in ends the one it replaces on the server. Every running session
+sees a sign-out or a new sign-in within a few seconds. After a sign-out the
+watch stops with no line. After a new sign-in the watch starts again on it.
+
+If the sign-in stops working (you disconnected it, or 90 days passed), the
+session gets one line, `[passerjack] watch stopped: sign-in expired, run
+/passerjack:connect`. Run that command and the watch starts again by itself.
+
 ## Settings
 
-The watcher reads the environment and nothing else, so the key never lands in a
-settings file or on a command line.
+All settings are optional. The watcher reads them from the environment.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `PASSERJACK_API_KEY` | none, required | An API key from Settings > Agents on passerjack.com. The `read` scope is enough. |
+| `PASSERJACK_API_KEY` | unset | An API key from Settings > Agents on passerjack.com. When it is set, the watcher uses it and not the saved sign-in. A change to it needs a restart of Claude Code. Most people do not need it: use `/passerjack:connect`. |
 | `PASSERJACK_WATCH_TAG` | `claude` | Items you tag with this wake the session. Set it to an empty value to turn items off. |
 | `PASSERJACK_WATCH_NAME` | unset | Adds a mailbox: messages sent to this name (`desk`, `laptop`) wake the session too, and the session is listed under this name. Without it the session still hears messages sent by hints. |
-| `PASSERJACK_ORIGIN` | `https://passerjack.com` | Only for a local development server: `https://passerjack.com` or a localhost address, nothing else, so a project's settings cannot point your key somewhere else. |
-
-Windows (a new terminal picks it up):
-
-```
-setx PASSERJACK_API_KEY pj_...
-```
-
-macOS and Linux, in your shell profile:
-
-```
-export PASSERJACK_API_KEY=pj_...
-```
+| `PASSERJACK_ORIGIN` | `https://passerjack.com` | Only for a local development server: `https://passerjack.com` or a localhost address, nothing else, so a project's settings cannot point your key somewhere else. The saved sign-in is used only for the origin it was made on. |
 
 The PasserJack tools themselves (`get_item`, `check_messages` and the rest) come
 from the PasserJack MCP connection. If you have not connected it yet, follow
@@ -75,7 +128,12 @@ One line each, and nothing else:
 - A count, when several land at once or while the watch was reconnecting.
 - `[passerjack] watch offline since ..., still retrying` after ten minutes
   without a connection, and `[passerjack] watch back online` when it returns.
-- `[passerjack] watch stopped: the API key was refused` if the key is revoked.
+- `[passerjack] watch waiting for sign-in: run /passerjack:connect` when this
+  computer is not connected yet. The watch starts by itself after the sign-in.
+- `[passerjack] watch stopped: sign-in expired, run /passerjack:connect` (or
+  `the saved API key was refused`) when the saved sign-in stops working.
+- `[passerjack] watch stopped: the API key was refused` if the key in
+  `PASSERJACK_API_KEY` is revoked.
 
 Lines never carry contents. The bundled `passerjack-inbox` skill tells Claude
 to read the item or message with the MCP tools, to treat message text as data
@@ -140,9 +198,12 @@ those wake-ups never happen. Transient network errors print nothing.
 ## Uninstall
 
 ```
+/passerjack:connect --sign-out
 /plugin uninstall passerjack@passerjack
 /plugin marketplace remove passerjack
 ```
 
-Then delete `PASSERJACK_API_KEY` from your environment and revoke the key in
-Settings > Agents if you no longer use it.
+The first command ends the sign-in on the server and deletes the saved file.
+Run it before the uninstall, because the uninstall removes the command. If you
+set `PASSERJACK_API_KEY`, delete it from your environment and revoke the key in
+Settings > Agents.

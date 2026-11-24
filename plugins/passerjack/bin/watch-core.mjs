@@ -65,45 +65,59 @@ const MESSAGE_NAME_RE = /^[a-z0-9._-]{1,32}$/;
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
- * The watcher's configuration, read from the environment and nowhere else (a
- * monitor cannot be handed plugin user settings, and a key on a command line
- * is a key in every process listing).
+ * The origin from `PASSERJACK_ORIGIN`, or the default. Answers
+ * `{ ok: true, origin }` or `{ ok: false, line }`.
  *
- * Answers `{ ok: true, ... }` or `{ ok: false, line }`, where `line` is the ONE
- * line to print before exiting 0. Exit 0 and not 1: the monitor has done what
- * it can, and a failure status would only add noise to the session.
+ * PINNED: a key or a token goes to PasserJack itself or to this machine, and
+ * nowhere else. The monitor inherits the session's environment, which includes
+ * a project's checked-in settings `env` block, so an unpinned origin would let
+ * any repository you open point your key at its own server, silently. The
+ * sign-in (`connect.mjs`) refuses any other origin, and the credentials file
+ * is held to the same pin when it is READ: `parseCredential` drops a
+ * credential whose `origin` fails `originAllowed`, so no refresh or revoke is
+ * ever sent to an origin that a file names. For the same reason no variable
+ * chooses where that file lives (`credentialsPath`): only the home folder does.
  */
-export function readConfig(env, platform = process.platform) {
-  const key = (env.PASSERJACK_API_KEY ?? "").trim();
-  if (!key) {
-    const how =
-      platform === "win32"
-        ? "setx PASSERJACK_API_KEY <key>"
-        : "export PASSERJACK_API_KEY=<key> in your shell profile";
-    return {
-      ok: false,
-      line: `${LINE_PREFIX} watch not started: no API key. Make one in PasserJack under Settings > Agents, run ${how}, then restart Claude Code`,
-    };
-  }
-  let origin;
+export function resolveOrigin(env) {
   try {
-    // PINNED: the key goes to PasserJack itself or to this machine, and nowhere
-    // else. The monitor inherits the session's environment, which includes a
-    // project's checked-in settings `env` block, so an unpinned origin would
-    // let any repository you open point your key at its own server, silently.
     const url = new URL((env.PASSERJACK_ORIGIN ?? "").trim() || DEFAULT_ORIGIN);
-    const local = LOCAL_HOSTS.has(url.hostname);
-    const hosted = url.protocol === "https:" && url.origin === DEFAULT_ORIGIN;
-    if (!hosted && !(local && (url.protocol === "https:" || url.protocol === "http:"))) {
+    if (!originAllowed(url)) {
       return {
         ok: false,
         line: `${LINE_PREFIX} watch not started: PASSERJACK_ORIGIN may only be ${DEFAULT_ORIGIN} or a localhost address`,
       };
     }
-    origin = url.origin;
+    return { ok: true, origin: url.origin };
   } catch {
     return { ok: false, line: `${LINE_PREFIX} watch not started: PASSERJACK_ORIGIN is not an address` };
   }
+}
+
+/** The pin itself: the hosted origin over https, or a localhost address over http or https. */
+export function originAllowed(url) {
+  const local = LOCAL_HOSTS.has(url.hostname);
+  const hosted = url.protocol === "https:" && url.origin === DEFAULT_ORIGIN;
+  return hosted || (local && (url.protocol === "https:" || url.protocol === "http:"));
+}
+
+/**
+ * The watcher's configuration from the environment. The key is OPTIONAL: when
+ * `PASSERJACK_API_KEY` is unset, `key` is null and the watcher reads the
+ * credentials file that `/passerjack:connect` writes (`credentials.mjs`),
+ * waiting for it if it is not there yet. A set variable always wins over the
+ * file. (A monitor cannot be handed plugin user settings, and a key on a
+ * command line is a key in every process listing.)
+ *
+ * Answers `{ ok: true, key, origin, lanes }` or `{ ok: false, line }`, where
+ * `line` is the ONE line to print before exiting 0. Exit 0 and not 1: the
+ * monitor has done what it can, and a failure status would only add noise to
+ * the session.
+ */
+export function readConfig(env) {
+  const key = (env.PASSERJACK_API_KEY ?? "").trim() || null;
+  const resolved = resolveOrigin(env);
+  if (!resolved.ok) return resolved;
+  const origin = resolved.origin;
   // Unset means the default; set to nothing means "no item lane".
   const tag = env.PASSERJACK_WATCH_TAG === undefined ? DEFAULT_TAG : env.PASSERJACK_WATCH_TAG.trim();
   const rawName = (env.PASSERJACK_WATCH_NAME ?? "").trim().toLowerCase();
@@ -586,8 +600,21 @@ export class OutageMemo {
   }
 }
 
-/** The line a 401 prints before the watcher exits. */
+/** The line a 401 prints before the watcher exits, for a key from `PASSERJACK_API_KEY`. */
 export const KEY_REFUSED_LINE = `${LINE_PREFIX} watch stopped: the API key was refused`;
+
+/**
+ * The ONE line printed when there is no key in the environment and no usable
+ * sign-in in the credentials file. The watcher then checks the file every few
+ * seconds and starts on its own when `/passerjack:connect` writes it.
+ */
+export const WAITING_FOR_SIGN_IN_LINE = `${LINE_PREFIX} watch waiting for sign-in: run /passerjack:connect`;
+
+/** A browser sign-in whose refresh the server refused (revoked, expired, replaced). The watcher waits again. */
+export const SIGN_IN_EXPIRED_LINE = `${LINE_PREFIX} watch stopped: sign-in expired, run /passerjack:connect`;
+
+/** A key saved by `/passerjack:connect --paste` that the server refused. The watcher waits again. */
+export const SAVED_KEY_REFUSED_LINE = `${LINE_PREFIX} watch stopped: the saved API key was refused, run /passerjack:connect`;
 
 /**
  * The ONE line a nameless message lane prints when it cannot get a session:

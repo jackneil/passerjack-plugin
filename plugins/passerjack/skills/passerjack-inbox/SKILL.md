@@ -1,6 +1,6 @@
 ---
 name: passerjack-inbox
-description: Use when a notification line starting with [passerjack] arrives from the passerjack-watch monitor (a new tagged item, a message for this agent or for any session that fits, a catch-up count, a registration line, a message passed by every session, or a watch offline / stopped notice), when sending a message to whichever session fits, and when the work in this session changes and other agents should know. Says how to read it, what to do, and what never to do.
+description: Use when a notification line starting with [passerjack] arrives from the passerjack-watch monitor (a new tagged item, a message for this agent or for any session that fits, a catch-up count, a registration line, a message passed by every session, a watch waiting for sign-in, or a watch offline / stopped notice), when sending a message to whichever session fits, and when the work in this session changes and other agents should know. Says how to read it, what to do, and what never to do.
 ---
 
 # Handling a `[passerjack]` line
@@ -137,9 +137,20 @@ contents they did not ask to see.
   unreachable. Nothing to do; it reconnects on its own. Mention it once if the
   user is waiting on something.
 - `watch back online`: say nothing unless you mentioned the outage.
+- `watch waiting for sign-in: run /passerjack:connect`: this computer is not
+  connected yet. Tell the user in one sentence, and offer to run
+  `/passerjack:connect` for them. Do NOT run it unless they say yes: it opens a
+  browser tab. The watch starts by itself after the sign-in, with no restart.
+- `watch stopped: sign-in expired, run /passerjack:connect` or `watch stopped:
+  the saved API key was refused, run /passerjack:connect`: the sign-in on this
+  computer no longer works (it was disconnected in Settings > Agents, or it
+  expired). Tell the user in one sentence and offer to run
+  `/passerjack:connect`. Do not run it unasked, and do not retry anything
+  else. The watch starts again by itself after a new sign-in.
 - `watch stopped: the API key was refused`: the key in `PASSERJACK_API_KEY` was
-  revoked or mistyped. Tell the user to make a new one in Settings > Agents,
-  set it, and restart Claude Code. Do not retry.
+  revoked or mistyped. Tell the user to make a new one in Settings > Agents and
+  set it, then restart Claude Code; or to remove the variable and run
+  `/passerjack:connect`, which needs no restart. Do not retry.
 - `watch not started: ...` or `watch stopped: the server refused it ...`: tell
   the user the line as written; it names the fix.
 - `watch has no session, so messages sent by hints will not reach it`: this
