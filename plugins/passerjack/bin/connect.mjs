@@ -721,12 +721,26 @@ async function paste(ctx, origin, file, from) {
   return 0;
 }
 
-/** A live check of the saved credential, refreshing it first when it is due. */
+/**
+ * A live check of the saved credential, refreshing it first when it is due.
+ * `unsaved` is true when the server rotated the pair and the file could not
+ * take it: the file then holds a spent refresh token, and the new pair dies
+ * with this process, so the caller must not say "connected".
+ */
 async function liveWho(ctx, file, cred) {
   let current = cred;
+  /** A rotated pair that the file refused, as `refreshUnderLock` hands it back. */
+  let unsaved = null;
   const recover = async (staleToken) => {
-    const out = await renewCredential(file, { staleToken, refresh: (c) => requestRefresh(c, ctx.fetch), retryMs: ctx.refusedRetryMs });
-    return out.kind === "ok" ? out.cred : out.kind;
+    const out = await renewCredential(file, {
+      staleToken,
+      refresh: (c) => requestRefresh(c, ctx.fetch),
+      retryMs: ctx.refusedRetryMs,
+      unsaved,
+    });
+    if (out.kind !== "ok") return out.kind;
+    unsaved = out.saved === false ? { cred: out.cred, replaces: out.replaces } : null;
+    return out.cred;
   };
   if (needsRefresh(current)) {
     const next = await recover(bearerOf(current));
@@ -740,7 +754,7 @@ async function liveWho(ctx, file, cred) {
     current = next;
     answer = await whoAmI(ctx, cred.origin, bearerOf(current));
   }
-  return { ...answer, cred: current };
+  return { ...answer, cred: current, unsaved: unsaved !== null };
 }
 
 async function status(ctx, origin, file) {
@@ -756,6 +770,14 @@ async function status(ctx, origin, file) {
   }
   const how = cred.kind === "oauth" ? " (browser sign-in)" : " (saved API key)";
   const live = await liveWho(ctx, file, cred);
+  if (live.unsaved) {
+    // Never "connected": the setup page skips the sign-in on that word, and
+    // the file holds a refresh token that the server already spent.
+    ctx.print(
+      `${LINE_PREFIX} sign-in not saved on ${origin}: the server renewed it, but the credentials file could not be written. Make the file and its folder writable, then run /passerjack:connect`,
+    );
+    return 1;
+  }
   if (live.status === 200) {
     ctx.print(connectedLine(live.who, origin, how));
     noteEnvKey(ctx);

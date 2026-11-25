@@ -452,7 +452,8 @@ export async function requestRefresh(cred, fetchImpl = fetch) {
  * credential is dead: the refresh was refused, or the saved key IS the stale
  * one), `{ kind: "gone" }` (no usable file any more: signed out) or `{ kind:
  * "transient" }`. `saved: false` means the server rotated the pair and the
- * file could not be written: the caller keeps `cred` in memory and passes it
+ * file could not be written (this time, or for a kept `unsaved` pair, again):
+ * the caller keeps `cred` in memory and passes it
  * back as `unsaved`, because the server has already spent the old refresh
  * token and the new pair is the only one that works.
  *
@@ -470,16 +471,23 @@ export async function refreshUnderLock(file, { staleToken, refresh, now = Date.n
       let current = readCredentials(file);
       // The refresh token that the FILE holds, whatever this process holds in memory.
       let inFile = current?.kind === "oauth" ? current.refreshToken : null;
+      // True while the file holds a refresh token that the server already spent.
+      let stillUnsaved = false;
       if (unsaved && current?.kind === "oauth" && current.refreshToken === unsaved.replaces && sameSignIn(current, unsaved.cred)) {
         try {
           current = writeCredentials(file, unsaved.cred);
           inFile = current.refreshToken;
         } catch {
           current = unsaved.cred;
+          stillUnsaved = true;
         }
       }
       if (!current) return { kind: "gone" };
-      if (bearerOf(current) !== staleToken && !needsRefresh(current, now())) return { kind: "ok", cred: current, saved: true };
+      if (bearerOf(current) !== staleToken && !needsRefresh(current, now())) {
+        // A kept pair that the file refused again is still only in memory:
+        // saying `saved: true` here made the caller drop the one pair that works.
+        return stillUnsaved ? { kind: "ok", cred: current, saved: false, replaces: inFile } : { kind: "ok", cred: current, saved: true };
+      }
       if (current.kind !== "oauth") return { kind: "refused" };
       const out = await refresh(current);
       if (out.kind !== "ok") return out;

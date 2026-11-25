@@ -35,10 +35,11 @@ can wake this session. The user's argument: `$ARGUMENTS`
      to open the address on any computer and press Connect. The page after
      that does not load. The user copies the full address of that page (it
      starts with `http://127.0.0.1:`) and gives it to you. Then run this, with
-     the address in double quotes, and wait for it:
+     the address in single quotes, and wait for it. Do not use double quotes:
+     a shell changes `$` and backticks inside them.
 
      ```
-     node "${CLAUDE_PLUGIN_ROOT}/bin/connect.mjs" --relay "<address>"
+     node "${CLAUDE_PLUGIN_ROOT}/bin/connect.mjs" --relay '<address>'
      ```
 
    - When the background task ends, report its `[passerjack]` lines.
@@ -49,8 +50,8 @@ can wake this session. The user's argument: `$ARGUMENTS`
      within a few seconds. No restart is necessary. The monitor then prints
      `[passerjack] registered as ...`. If that line does not come within about
      10 seconds, tell the user to run `/reload-plugins`.
-   - `connect failed: ...`, `connect stopped: ...` or `sign-out not finished:
-     ...`: the line says what to do.
+   - `connect failed: ...`, `connect stopped: ...`, `sign-in not saved ...`
+     or `sign-out not finished: ...`: the line says what to do.
    - `note: ...`: tell the user the note.
 6. The output never contains a key or a token. Do not look for one, and do not
    read the credentials file or a key file.

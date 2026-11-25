@@ -38,6 +38,12 @@ repository, and it is no longer a marketplace:
 /plugin install passerjack@passerjack
 ```
 
+If you update from version 0.1.0 inside a session that is open, restart
+Claude Code one time after `/passerjack:connect`. The 0.1.0 watcher stopped
+when it found no key, and `/reload-plugins` does not start a monitor again in
+the same session. Version 0.2.0 and later does not stop: it waits for the
+sign-in.
+
 ## Connect
 
 `/passerjack:connect` does one of these things:
@@ -47,7 +53,7 @@ repository, and it is no longer a marketplace:
 | `/passerjack:connect` | Signs in through your browser. It asks for the `read` permission only. |
 | `/passerjack:connect --paste` | Saves an API key from your clipboard. |
 | `/passerjack:connect --paste <file>` | Saves an API key from a file. Use it when the computer has no clipboard. Delete the file after. |
-| `/passerjack:connect --status` | Says if this computer is connected, and to which account. |
+| `/passerjack:connect --status` | Says if this computer is connected, and to which account. If the server renewed the sign-in but the saved file could not be written, it says `sign-in not saved` and the sign-in stops working soon: make the file's folder writable and connect again. |
 | `/passerjack:connect --sign-out` | Ends the sign-in on the server and deletes the saved file. If the server does not confirm it, the file stays and the line says so. |
 
 To make a key for `--paste`: in Settings > Agents on passerjack.com, open Use

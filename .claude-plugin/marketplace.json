@@ -11,7 +11,7 @@
       "name": "passerjack",
       "source": "./plugins/passerjack",
       "description": "Watch PasserJack for the whole session: tagged items and messages wake the session as they arrive.",
-      "version": "0.2.0"
+      "version": "0.2.1"
     }
   ]
 }

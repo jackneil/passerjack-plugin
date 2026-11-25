@@ -1,6 +1,6 @@
 {
   "name": "passerjack",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Watch PasserJack for the whole session: items you tag for Claude and messages for this agent's name wake the session as they arrive, with no re-arming.",
   "author": {
     "name": "Jack Neil"

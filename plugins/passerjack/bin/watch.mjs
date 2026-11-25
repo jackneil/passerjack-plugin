@@ -81,7 +81,7 @@ import {
   sessionIdFrom,
 } from "./watch-core.mjs";
 
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 
 function print(line) {
   process.stdout.write(`${line}\n`);
