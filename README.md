@@ -109,7 +109,8 @@ All settings are optional. The watcher reads them from the environment.
 | --- | --- | --- |
 | `PASSERJACK_API_KEY` | unset | An API key from Settings > Agents on passerjack.com. When it is set, the watcher uses it and not the saved sign-in. A change to it needs a restart of Claude Code. Most people do not need it: use `/passerjack:connect`. |
 | `PASSERJACK_WATCH_TAG` | `claude` | Items you tag with this wake the session. Set it to an empty value to turn items off. |
-| `PASSERJACK_WATCH_NAME` | unset | Adds a mailbox: messages sent to this name (`desk`, `laptop`) wake the session too, and the session is listed under this name. Without it the session still hears messages sent by hints. |
+| `PASSERJACK_WATCH_NAME` | unset | Adds a mailbox: messages sent to this name (`desk`, `laptop`) wake the session too, and the session is listed under this name. Without it the session still hears messages sent by hints, and Claude can give the session a name while it runs (see "Give the session a name"). When it is set, the watcher puts this name back each time it reconnects. |
+| `PASSERJACK_SHARE_LAST_MESSAGE` | on | The hooks send a finished turn's last message to your Agents page after a minute of silence. Exactly `0` turns that off on this computer: the page still shows that the session waits for you, with no text (see "The Agents page"). |
 | `PASSERJACK_ORIGIN` | `https://passerjack.com` | Only for a local development server: `https://passerjack.com` or a localhost address, nothing else, so a project's settings cannot point your key somewhere else. The saved sign-in is used only for the origin it was made on. |
 
 The PasserJack tools themselves (`get_item`, `check_messages` and the rest) come
@@ -128,7 +129,8 @@ One line each, and nothing else:
   when an item you captured gains the tag. Items an agent files back under the
   tag do not ring, so the session never wakes itself.
 - `[passerjack] message 1a2b3c4d for "desk" from "Claude Code laptop", subject "build is green"`
-  when a message for `PASSERJACK_WATCH_NAME` arrives.
+  when a message for the name this session holds arrives
+  (`PASSERJACK_WATCH_NAME`, or a name Claude gave the session).
 - `[passerjack] message 1a2b3c4d for "*" from "Claude Code desk" ...` when
   another agent sends by hints instead of a name (see below).
 - A count, when several land at once or while the watch was reconnecting.
@@ -162,6 +164,83 @@ A watcher with no `PASSERJACK_WATCH_NAME` still registers its session and rings
 for hinted messages delivered to it. Setting a name adds a mailbox on top: the
 session then also rings for messages sent to that name.
 
+## Give the session a name
+
+The name lives on the session that the watcher registered. Ask Claude to give
+this session a name and it calls `set_status` with the session's id and a
+`name` (1 to 32 characters of a-z, 0-9, dot, dash and underscore). From then
+on, messages sent to that name ring this watch at once, with no restart and no
+environment variable. Claude does not call `register_session` in Claude Code:
+that makes a second session that has no watch, so nothing rings for it. The
+skill in version 0.3.0 and later tells Claude to do this. The server half works
+with every version of the watcher, because the watcher itself did not change.
+
+A sender by name is told `listening: false` when nothing woke (no live
+session holds the name, or the sessions that hold it have no watch open), so
+it tells you rather than wait in silence. A new watcher process (a
+new `registered as` line with a new id) is a new session: give it the name
+again.
+
+## The Agents page
+
+On passerjack.com (or in the app) the Agents page lists every agent session
+of your account and what each one waits for. You can write to one session
+there, and read its answer. A message you type on that page is your own words
+to that one session: the watcher wakes the session, and the skill tells Claude
+to act on it as on a line you typed in the terminal, inside your standing
+instructions and its normal permission rules. Every other message stays
+untrusted data.
+
+When Claude needs a decision and you are away, it asks with `message_user`
+and `question: true`. The page shows the question in amber, and your phone
+gets a push.
+
+### What the hooks send, and where
+
+The plugin has six hooks (`hooks/hooks.json`). Each runs in the background,
+prints nothing, and exits with no error whatever happens. A hook that sends
+something sends one small request to `POST /api/sessions/<id>/state` on
+PasserJack, for the session that this watcher registered, with the credential
+that registered it:
+
+- **After a turn ends.** When nothing happens for a minute (no prompt, no tool
+  result, no new turn, no `/clear`) and no background task other than this
+  watcher runs, it says that the session waits for you, with the turn's last
+  message. The text goes to your own PasserJack account and shows on the
+  Agents page. It never sends a push.
+- **A permission prompt.** When a permission prompt is still up after a
+  minute, it says so, with the tool's name only (never what the tool would
+  do). That sends a push: answer the prompt at the terminal. A prompt that
+  you approved, whose tool still runs, sends nothing: the hook sees the
+  tool's process. When Claude Code says that it waits for you while the
+  prompt is up, the hook says so at once.
+- **A tool finishes after a permission prompt.** It says that the session
+  works again.
+- **You type.** Each prompt you type says that the session works, so a
+  question you answer at the terminal never reaches your phone.
+
+The hooks keep a small file of their own beside the watcher's file: a counter
+and the permission prompt that is up, never a text, a key or a token.
+
+The watcher tells the hooks which session it holds through a small file in
+`~/.config/passerjack/sessions/` (`%LOCALAPPDATA%\PasserJack\sessions\` on
+Windows): the session id, the PasserJack address and the watcher's process id.
+The file never holds a key or a token. A hook never renews a sign-in: it uses
+the token the watcher keeps current, and skips one post when that token has
+run out.
+
+### Do not send the turn's text
+
+To keep the turn's last message on this computer, set this before you start
+Claude Code:
+
+```
+export PASSERJACK_SHARE_LAST_MESSAGE=0
+```
+
+Exactly `0` turns it off; any other value, or none, leaves it on. With it off,
+the page still shows that the session waits for you, with no text.
+
 ## Other harnesses
 
 Claude Code is the only harness this plugin can wake. Codex, Gemini CLI and the
@@ -179,7 +258,8 @@ At start the watcher lists this session on your account so your other agents
 - the repository as `owner/name` from the `origin` remote (never the URL, so a
   token in the remote never leaves your machine),
 - the current branch,
-- `PASSERJACK_WATCH_NAME`, when set,
+- `PASSERJACK_WATCH_NAME`, when set, or the name the agent gives the session
+  with `set_status`,
 - a one-line status, when the agent sets one with `set_status`.
 
 Every agent with a key on your account can read these with `list_sessions`, so
@@ -187,11 +267,14 @@ do not name a folder or branch after something private. The key itself is
 never sent anywhere but the request header.
 
 The listing stays current while the watcher is connected. When Claude Code
-closes it, the watcher ends the session; if it is killed outright, the session
-drops off the list within ten minutes. On Windows a closed terminal may deliver
-no signal, in which case the session is not ended: it goes quiet and drops off
-the list ten minutes later. If registering fails for any reason,
-the watcher prints nothing about it and keeps watching.
+closes, the session goes quiet and drops off the list of live sessions within
+ten minutes. The watcher never deletes the session: its Agents page
+conversation stays, with any message from you that it did not read yet, and
+the session expires a day after its last sign of life. When you start Claude
+Code again in the same conversation (a resume), the watcher comes back to the
+same session, so a message that you sent meanwhile still reaches it. If
+registering fails for any reason, the watcher prints nothing about it and
+keeps watching.
 
 ## Cost
 

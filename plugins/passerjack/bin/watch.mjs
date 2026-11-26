@@ -34,11 +34,21 @@
  * the working directory's last segment, the repo's `owner/name`, the branch)
  * and prints ONE line saying so; before every reconnect it registers again,
  * silently and idempotently (same `clientId`), and each feed carries the
- * session id so the server can keep it marked present. A registration that
- * fails prints nothing and the watch runs on without presence. SIGINT, SIGTERM
- * and SIGHUP end the session (a DELETE bounded at two seconds) and exit: the
- * lanes never resolve on their own, so `beforeExit` would never fire, and the
- * signal handlers are the exit path.
+ * session id so the server can keep it marked present. The `clientId` comes
+ * from the Claude Code session and the sign-in (`sessionClientId`), so a
+ * restarted or resumed Claude Code comes back to the SAME row. A registration
+ * that fails prints nothing and the watch runs on without presence.
+ *
+ * THE WATCHER NEVER ENDS ITS SESSION ON THE SERVER. SIGINT, SIGTERM and SIGHUP
+ * (Claude Code closing), a new sign-in and every lane stopping all leave the
+ * row in place: `DELETE /api/sessions/<id>` cascades the session's Agents page
+ * thread away (migration 0138), with an owner message that the session did
+ * not read yet and a reply that the owner did not read yet. The row goes
+ * quiet once its feed is gone and expires a day after its last sign of life;
+ * the agent bridge does the same (`bridge.mjs`, session end). The signal
+ * handlers are the exit path (the lanes never resolve on their own, so
+ * `beforeExit` would never fire): they let a refresh in flight finish, remove
+ * this watcher's link file and exit.
  */
 
 import { execFile } from "node:child_process";
@@ -54,8 +64,10 @@ import {
   renewCredential,
   requestRefresh,
   sameSignIn,
+  signInIdentity,
 } from "./credentials.mjs";
 import { findOnPath, safeCwd } from "./programs.mjs";
+import { claudeKey, linkedElsewhere, linkHolder, linksDir, processAlive, removeLink, sessionClientId, sweepLinks, writeLink } from "./session-link.mjs";
 import {
   BurstWindow,
   IDLE_TIMEOUT_MS,
@@ -76,12 +88,21 @@ import {
   lineForFrame,
   readConfig,
   registeredLine,
+  reprintsRegistered,
   resumeHeader,
   sessionBody,
   sessionIdFrom,
 } from "./watch-core.mjs";
 
-const VERSION = "0.2.1";
+const VERSION = "0.3.0";
+
+/**
+ * Where this watcher tells the plugin's hooks which session it holds
+ * (`session-link.mjs`): the folder beside the credentials file, and the
+ * Claude Code process id it runs under. No credential is ever in that file.
+ */
+const LINKS_DIR = linksDir();
+const CLAUDE_KEY = claudeKey(process.env);
 
 function print(line) {
   process.stdout.write(`${line}\n`);
@@ -104,13 +125,16 @@ function sleep(ms, signal) {
 /** How often the waiting watcher looks at the credentials file: one `stat`. */
 const SIGN_IN_POLL_MS = 3000;
 
+/** The least time between two renewals that `keepFresh` starts. */
+const KEEP_FRESH_RETRY_MS = 60_000;
+
 /** Statuses asking again will never fix: say so once and stop that lane. */
 const PERMANENT = new Set([400, 403, 404]);
 
 /** How long a registration may take before the watch goes on without it. */
 const REGISTER_TIMEOUT_MS = 5000;
 
-/** The whole budget for ending the session on the way out. */
+/** The most the way out waits for a refresh in flight, so its rotated pair is saved. */
 const END_TIMEOUT_MS = 2000;
 
 /**
@@ -135,6 +159,7 @@ class EnvAuth {
   constructor(key) {
     this.key = key;
     this.kind = "env";
+    this.identity = signInIdentity({ kind: "env", key });
     this.dead = false;
     this.stopReason = null;
     this.signal = new AbortController().signal;
@@ -185,6 +210,8 @@ class FileAuth {
     this.file = file;
     this.cred = cred;
     this.kind = cred.kind;
+    /** The sign-in this watch runs on; a rotated pair keeps it, a new sign-in is a new watch. */
+    this.identity = signInIdentity(cred);
     this.dead = false;
     this.stopReason = null;
     this.controller = new AbortController();
@@ -194,6 +221,8 @@ class FileAuth {
     this.unsaved = null;
     this.fileTimer = null;
     this.fileStamp = statStamp(file);
+    /** When `keepFresh` last tried a renewal, so a failing one is tried once a minute and no more. */
+    this.lastKeepFresh = 0;
   }
 
   get stopped() {
@@ -267,6 +296,7 @@ class FileAuth {
    */
   watchFile(origin) {
     this.fileTimer = setInterval(() => {
+      this.keepFresh();
       const stamp = statStamp(this.file);
       if (stamp === this.fileStamp) return;
       this.fileStamp = stamp;
@@ -281,6 +311,23 @@ class FileAuth {
       }
     }, SIGN_IN_POLL_MS);
     this.fileTimer.unref?.();
+  }
+
+  /**
+   * Renew the sign-in ahead of its expiry even while no connect asks for a
+   * token. The plugin's hooks read the access token from the file and never
+   * renew it themselves (`hook.mjs`: a short process cannot keep a rotated
+   * pair it failed to save), and a connect asks only about every fourteen
+   * minutes, so without this the file could hold a token that has run out
+   * for minutes at a time and each hook in that time would post nothing.
+   * The same single-flight renewal, under the machine's lock, as a connect.
+   */
+  keepFresh() {
+    if (this.stopped || this.inFlight || !needsRefresh(this.cred)) return;
+    const now = Date.now();
+    if (now - this.lastKeepFresh < KEEP_FRESH_RETRY_MS) return;
+    this.lastKeepFresh = now;
+    void this.recover(this.token());
   }
 
   unwatchFile() {
@@ -349,11 +396,19 @@ class Presence {
     this.config = config;
     this.auth = auth;
     this.body = body;
+    /** The `clientId` this watch was given (`sessionClientId`); see the 409 in `post`. */
+    this.derivedClientId = body.clientId ?? null;
+    /** True once a 409 for the derived id was answered by registering with a random one. */
+    this.fellBack = false;
+    /** True once this watch left a row that another Claude Code process holds (`splitIfShared`). */
+    this.splitOff = false;
     this.id = null;
     this.confirmedAt = 0;
     this.inFlight = null;
     this.disabled = false;
     this.announcedId = null;
+    /** The session id the link file names now, or null when there is none. */
+    this.linkedId = null;
     /**
      * How the last registration went: `ok`, `unreachable` (no answer, or a
      * 5xx), `refused-401` (a dead key) or `refused-other` (any other refusal,
@@ -378,7 +433,7 @@ class Presence {
   }
 
   /** Answers `ok`, `unreachable`, `refused-401` or `refused-other`; see `lastOutcome`. */
-  async post(renewed = false) {
+  async post(renewed = false, fallback = false) {
     let res;
     const token = await this.auth.bearer();
     try {
@@ -399,7 +454,7 @@ class Presence {
       // ask once more. A renewal that cannot happen yet is a transient.
       await res.body?.cancel().catch(() => {});
       const recovered = await this.auth.recover(token);
-      if (recovered === "ok" && !renewed) return this.post(true);
+      if (recovered === "ok" && !renewed) return this.post(true, fallback);
       return recovered === "dead" ? "refused-401" : "unreachable";
     }
     let answer = null;
@@ -415,10 +470,33 @@ class Presence {
     // foreign clientId) means no session, and the feed goes without one.
     if (res.status >= 500) return "unreachable";
     if (res.status === 429) return "refused-other";
+    if (res.status === 409 && !fallback && !this.fellBack && this.derivedClientId && this.body.clientId === this.derivedClientId) {
+      // The derived id is held by another credential of this account (a row
+      // from an earlier sign-in that the hash did not tell apart). A 409 also
+      // means the session cap, so the random id is kept only when it works.
+      const derived = this.body.clientId;
+      this.body = { ...this.body, clientId: randomUUID() };
+      const outcome = await this.post(renewed, true);
+      if (outcome === "ok") {
+        this.fellBack = true;
+        return outcome;
+      }
+      this.body = { ...this.body, clientId: derived };
+      return outcome;
+    }
     const id = res.ok ? sessionIdFrom(answer) : null;
+    if (id && this.mayShare() && linkedElsewhere(LINKS_DIR, CLAUDE_KEY, id)) {
+      // Another running Claude Code process (a second terminal on a resumed
+      // session) holds this row: register a row of our own, before any link
+      // or line names the shared one (`linkedElsewhere`).
+      this.splitOff = true;
+      this.body = { ...this.body, clientId: randomUUID() };
+      return this.post(renewed, true);
+    }
     this.id = id;
     this.confirmedAt = id ? Date.now() : 0;
-    if (id && id !== this.announcedId) {
+    this.relink();
+    if (id && id !== this.announcedId && reprintsRegistered("new-id")) {
       this.announcedId = id;
       print(registeredLine({ ...this.body, id }));
     }
@@ -426,10 +504,89 @@ class Presence {
     return res.status === 401 ? "refused-401" : "refused-other";
   }
 
+  /**
+   * Keep the link file in step with the session this watcher holds, so the
+   * plugin's hooks post the turn's state for the right session, and for none
+   * when it has none.
+   */
+  relink() {
+    if (this.id === this.linkedId) return;
+    if (this.id) {
+      this.linkWritten(writeLink({ dir: LINKS_DIR, key: CLAUDE_KEY, sessionId: this.id, origin: this.config.origin, watcherPid: process.pid }));
+    } else {
+      // Only this watcher's own link: another watcher of the same Claude Code
+      // process (a plugin reload) may hold the file now.
+      removeLink(LINKS_DIR, CLAUDE_KEY, process.pid);
+    }
+    this.linkedId = this.id;
+  }
+
+  /**
+   * Put the link back when it is gone, or names a watcher that has exited or
+   * another session: a second watcher of this Claude Code process that
+   * exited took it with it. A live other watcher's link for the same session
+   * is left alone. One small read, before each connect.
+   */
+  ensureLink() {
+    if (!this.id || !CLAUDE_KEY) return;
+    const held = linkHolder(LINKS_DIR, CLAUDE_KEY);
+    if (held && held.sessionId === this.id && (held.watcherPid === process.pid || processAlive(held.watcherPid))) return;
+    this.linkWritten(writeLink({ dir: LINKS_DIR, key: CLAUDE_KEY, sessionId: this.id, origin: this.config.origin, watcherPid: process.pid }));
+    this.linkedId = this.id;
+  }
+
+  /** Whether this watch still uses the derived `clientId`, so it may share a row with another process. */
+  mayShare() {
+    return Boolean(CLAUDE_KEY && !this.splitOff && this.derivedClientId && this.body.clientId === this.derivedClientId);
+  }
+
+  /**
+   * The watch's few-second check (`watchWith`): put a lost link back at once
+   * (a second watcher of this process that exited took it), not at the next
+   * connect up to fourteen minutes later, and leave a row that a Claude Code
+   * process with a LOWER key also holds. Two terminals that started in the
+   * same instant both registered before either link was written; the lower
+   * key keeps the row, the higher one moves. Never throws.
+   */
+  tick() {
+    if (this.disabled || !this.id) return;
+    this.ensureLink();
+    if (this.mayShare() && linkedElsewhere(LINKS_DIR, CLAUDE_KEY, this.id, { lowerThan: CLAUDE_KEY })) {
+      this.splitOff = true;
+      this.body = { ...this.body, clientId: randomUUID() };
+      this.confirmedAt = 0;
+      void this.register();
+    }
+  }
+
+  /**
+   * A session says `waits: true` only while its hooks can find it. When the
+   * link cannot be written (a folder that is not writable), the hooks post
+   * nothing, no `idle` ever comes, and a question push that the server holds
+   * for the idle would never go: register again at once with an explicit
+   * `waits: false` (a re-registration keeps a `waits` it does not send), so
+   * questions push at once. A later link that lands says `waits: true` again.
+   */
+  linkWritten(ok) {
+    if (!CLAUDE_KEY || this.body.waits === ok) return;
+    this.body = { ...this.body, waits: ok };
+    this.confirmedAt = 0;
+    // After the registration in flight (this runs inside it) has finished.
+    setTimeout(() => {
+      if (!this.disabled) void this.register();
+    }, 0).unref?.();
+  }
+
+  /** Print the `registered` line again for this session, when `reprintsRegistered(reason)` says so. */
+  announceAgain(reason) {
+    if (this.id && !this.disabled && reprintsRegistered(reason)) print(registeredLine({ ...this.body, id: this.id }));
+  }
+
   /** The session id a connect should carry, registering again first unless that just happened. */
   async beforeConnect() {
     if (this.disabled) return null;
     if (Date.now() - this.confirmedAt >= FRESH_MS) await this.register();
+    if (!this.disabled) this.ensureLink();
     return this.disabled ? null : this.id;
   }
 
@@ -452,25 +609,20 @@ class Presence {
       this.id = null;
       this.confirmedAt = 0;
     }
+    this.relink();
   }
 
-  /** End the session on the way out. Never throws, never takes longer than its budget. */
-  async end() {
-    const id = this.id;
+  /**
+   * The watch is over (Claude Code closes, a new sign-in, every lane
+   * stopped): stop using the session and remove this watcher's link. NO
+   * `DELETE /api/sessions/<id>`: it would cascade the Agents page thread away
+   * with the owner's unread words. The row goes quiet and expires a day after
+   * its last sign of life. Never throws.
+   */
+  leave() {
     this.disabled = true;
     this.id = null;
-    if (!id || this.auth.dead) return;
-    try {
-      await fetch(new URL(`/api/sessions/${id}`, this.config.origin), {
-        method: "DELETE",
-        headers: requestHeaders(this.auth.token()),
-        redirect: "error",
-        signal: AbortSignal.timeout(END_TIMEOUT_MS),
-      });
-    } catch {
-      // Out of time or unreachable: the row stops being listed on its own once
-      // its feed is gone.
-    }
+    this.relink();
   }
 }
 
@@ -546,7 +698,7 @@ async function connect(config, auth, lane, state, onOpen, sessionId) {
           continue;
         }
         sawFrame = true;
-        const out = lineForFrame(lane, record);
+        const out = lineForFrame(lane, record, sessionId);
         if (!out) continue;
         if (out.kind === "catchup") print(out.line);
         else state.burst.ring(out.line);
@@ -593,6 +745,11 @@ async function runLane(config, auth, lane, outage, presence, onlyLane) {
     burst: new BurstWindow(print, (n) => burstLineFor(lane, n), (fn, ms) => setTimeout(fn, ms).unref()),
   };
   const wait = (ms) => sleep(ms, auth.signal);
+  // The back-online line, and beside it this session's id again (`reprintsRegistered`).
+  const sayBack = (line) => {
+    print(line);
+    presence.announceAgain("back-online");
+  };
   let attempt = 0;
   for (;;) {
     if (auth.stopped) return;
@@ -626,7 +783,7 @@ async function runLane(config, auth, lane, outage, presence, onlyLane) {
     if (lane.kind === "messages" && lane.to === null) {
       // Registered again after an outage on this lane: say so if it was said.
       const back = outage.recovered(lane);
-      if (back) print(back);
+      if (back) sayBack(back);
     }
     const ended = await connect(
       config,
@@ -635,7 +792,7 @@ async function runLane(config, auth, lane, outage, presence, onlyLane) {
       state,
       () => {
         const line = outage.recovered(lane);
-        if (line) print(line);
+        if (line) sayBack(line);
       },
       sessionId,
     );
@@ -663,7 +820,7 @@ async function runLane(config, auth, lane, outage, presence, onlyLane) {
       // failure time would fake an offline line on the other lane's next blip
       // and hold "back online" back for good.
       const back = outage.recovered(lane);
-      if (back) print(back);
+      if (back) sayBack(back);
       print(laneStoppedLine(ended.status, ended.body));
       return;
     }
@@ -708,26 +865,31 @@ async function waitForSignIn(file, origin, refused) {
 }
 
 /**
- * One watch on one credential: register, run every lane, end the session.
- * Answers the credential's `stopReason` (`refused`, `signed-out` or
- * `replaced`) when it stopped, and `stopped` when every lane stopped for good.
- * Each watch registers with a NEW presence `clientId`: a new sign-in may be
- * another account, and the server refuses a `clientId` that another account
- * holds.
+ * One watch on one credential: register, run every lane, leave the session
+ * (never delete it). Answers the credential's `stopReason` (`refused`,
+ * `signed-out` or `replaced`) when it stopped, and `stopped` when every lane
+ * stopped for good. The presence `clientId` is the Claude Code session's and
+ * this sign-in's (`sessionClientId`): the same after a restart or a resume on
+ * the same sign-in, and a NEW one for a new sign-in, which may be another
+ * account (the server refuses a `clientId` that another credential holds).
  */
 async function watchWith(config, auth, facts, current) {
-  const presence = new Presence(config, auth, sessionBody(process.env, { ...facts, clientId: randomUUID() }));
+  const clientId = sessionClientId(process.env, { origin: config.origin, identity: auth.identity });
+  const presence = new Presence(config, auth, sessionBody(process.env, { ...facts, clientId }));
   current.presence = presence;
   current.auth = auth;
   if (auth instanceof FileAuth) auth.watchFile(config.origin);
+  const linkTimer = setInterval(() => presence.tick(), SIGN_IN_POLL_MS);
+  linkTimer.unref?.();
   try {
     await presence.register();
     const outage = new OutageMemo();
     const onlyLane = config.lanes.length === 1;
     await Promise.all(config.lanes.map((lane) => runLane(config, auth, lane, outage, presence, onlyLane)));
-    // Every lane stopped: nothing is watching, so nothing is present.
-    await presence.end();
+    // Every lane stopped: nothing is watching. The row goes quiet; it is never deleted.
+    presence.leave();
   } finally {
+    clearInterval(linkTimer);
     if (auth instanceof FileAuth) auth.unwatchFile();
   }
   return auth.stopReason ?? "stopped";
@@ -752,6 +914,8 @@ async function main() {
     print(config.line);
     return;
   }
+  // Link files a crashed session left behind, days old: gone before this one writes its own.
+  sweepLinks(LINKS_DIR);
   const facts = await gatherFacts();
   const current = { presence: null, auth: null };
   let ending = false;
@@ -765,7 +929,7 @@ async function main() {
     // server's 60-second grace, spends as a replay that revokes the
     // connection.
     within(current.auth?.inFlight, END_TIMEOUT_MS)
-      .then(() => current.presence?.end())
+      .then(() => current.presence?.leave())
       .finally(() => process.exit(0));
   };
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, stop);

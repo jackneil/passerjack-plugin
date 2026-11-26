@@ -1,6 +1,7 @@
 /**
  * Where the plugin finds the programs it starts: the browser opener, the
- * clipboard reader and `git`.
+ * clipboard reader, `git` and `ps`. And the process table that `ps` gives
+ * (`processTable`), which the permission waiters read.
  *
  * WHY NOT A BARE NAME. Node starts a program through libuv. On Windows, libuv
  * looks for a bare name in the CURRENT FOLDER first (`search_path` in
@@ -23,6 +24,7 @@
  * the Windows rules on any machine.
  */
 
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -125,3 +127,96 @@ export function programPath(name, { env = process.env, platform = process.platfo
   }
   return findOnPath(name, { env, platform, isProgram });
 }
+
+/**
+ * `ps`'s ELAPSED TIME, `[[dd-]hh:]mm:ss`, in milliseconds (whole seconds), or
+ * null for anything else.
+ *
+ * @param {string} text
+ */
+export function elapsedMs(text) {
+  const m = /^(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)$/.exec(String(text).trim());
+  if (!m) return null;
+  const [, days, hours, minutes, seconds] = m;
+  return (((Number(days ?? 0) * 24 + Number(hours ?? 0)) * 60 + Number(minutes)) * 60 + Number(seconds)) * 1000;
+}
+
+/**
+ * The output of `ps -A -o pid=,ppid=,etime=` as rows. Only the ids and the
+ * age of each process: no command line, no user, nothing anybody typed.
+ *
+ * @param {string} text
+ * @returns {{ pid: number, ppid: number, elapsedMs: number }[]}
+ */
+export function parseProcessTable(text) {
+  const rows = [];
+  for (const line of String(text).split("\n")) {
+    const [pid, ppid, etime] = line.trim().split(/\s+/);
+    const age = elapsedMs(etime ?? "");
+    if (!/^\d+$/.test(pid ?? "") || !/^\d+$/.test(ppid ?? "") || age === null) continue;
+    rows.push({ pid: Number(pid), ppid: Number(ppid), elapsedMs: age });
+  }
+  return rows;
+}
+
+/**
+ * `pid` and every process above it in `table`, up to the first one that the
+ * table does not hold (a loop in a table taken while processes changed ends
+ * too).
+ *
+ * @param {{ pid: number, ppid: number }[]} table
+ * @param {number} pid
+ */
+export function ancestorsOf(table, pid) {
+  const parent = new Map(table.map((row) => [row.pid, row.ppid]));
+  const seen = new Set();
+  for (let at = pid; Number.isSafeInteger(at) && at > 0 && !seen.has(at); at = parent.get(at) ?? 0) seen.add(at);
+  return seen;
+}
+
+/**
+ * Every process on the machine, with its parent and its age, or null when
+ * the table cannot be read: `ps` is not there (Windows), or it failed or took
+ * too long. A caller treats null as "unknown", never as "no process".
+ *
+ * `ps` is started by its absolute path like every other program here, with
+ * `LC_ALL=C` so that the columns do not move with the locale.
+ *
+ * @param {{ env?: Record<string, string | undefined>, platform?: string }} [options]
+ * @returns {Promise<{ pid: number, ppid: number, elapsedMs: number }[] | null>}
+ */
+export function processTable({ env = process.env, platform = process.platform } = {}) {
+  return new Promise((resolve) => {
+    if (platform === "win32") return resolve(null);
+    const ps = findOnPath("ps", { env, platform });
+    if (!ps) return resolve(null);
+    execFile(
+      ps,
+      ["-A", "-o", "pid=,ppid=,etime="],
+      { timeout: 3000, windowsHide: true, encoding: "utf8", env: { PATH: env.PATH ?? "", LC_ALL: "C" }, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) return resolve(null);
+        const table = parseProcessTable(stdout);
+        resolve(table.length ? table : null);
+      },
+    );
+  });
+}
+
+/**
+ * The live children of `parent`, other than the caller's own line of
+ * processes (`self` and everything above it), with their age, or null when
+ * the table cannot be read (`processTable`).
+ *
+ * @param {number} parent
+ * @param {{ self?: number, env?: Record<string, string | undefined>, platform?: string }} [options]
+ * @returns {Promise<{ pid: number, ppid: number, elapsedMs: number }[] | null>}
+ */
+export async function childrenOf(parent, { self = process.pid, env = process.env, platform = process.platform } = {}) {
+  if (!Number.isSafeInteger(parent) || parent <= 1) return null;
+  const table = await processTable({ env, platform });
+  if (!table) return null;
+  const mine = ancestorsOf(table, self);
+  return table.filter((row) => row.ppid === parent && !mine.has(row.pid));
+}
+

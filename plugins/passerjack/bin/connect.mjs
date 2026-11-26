@@ -91,10 +91,27 @@ const KEY_IN_TEXT_RE = /(?<![0-9A-Za-z_])pj_[0-9A-Za-z]{40}(?![0-9A-Za-z])/g;
 /** A key file is a few dozen bytes. A file larger than this is not one, and is refused before it is read. */
 const MAX_KEY_FILE_BYTES = 64 * 1024;
 
+/**
+ * Which program this copy of connect signs in for. The agent bridge installs
+ * its own copy under an `agent-bridge` folder (`BRIDGE_CONNECT` in
+ * `src/lib/agent-bridge-setup.ts`) for Codex, Grok, Gemini and the rest, so
+ * the consent screen must not say Claude Code there.
+ */
+export function connectProduct(fileUrl) {
+  let parts = [];
+  try {
+    parts = decodeURIComponent(new URL(fileUrl).pathname).split(/[\\/]/);
+  } catch {
+    return "claude-code";
+  }
+  return parts.includes("agent-bridge") ? "bridge" : "claude-code";
+}
+
 /** The name the consent screen and Settings > Agents > Connected apps show for this machine. */
-export function clientName(hostname) {
+export function clientName(hostname, product = "claude-code") {
   const host = oneLine(hostname, 80) ?? "this computer";
-  return `PasserJack for Claude Code on ${host}`.slice(0, MAX_CLIENT_NAME_CHARS);
+  const name = product === "bridge" ? `PasserJack bridge on ${host}` : `PasserJack for Claude Code on ${host}`;
+  return name.slice(0, MAX_CLIENT_NAME_CHARS);
 }
 
 /**
@@ -445,7 +462,7 @@ async function signIn(ctx, origin, file) {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify({
-          client_name: clientName(ctx.hostname),
+          client_name: clientName(ctx.hostname, connectProduct(import.meta.url)),
           redirect_uris: [redirectUri],
           token_endpoint_auth_method: "none",
           grant_types: ["authorization_code", "refresh_token"],

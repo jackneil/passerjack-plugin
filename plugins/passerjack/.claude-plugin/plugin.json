@@ -1,11 +1,11 @@
 {
   "name": "passerjack",
-  "version": "0.2.1",
-  "description": "Watch PasserJack for the whole session: items you tag for Claude and messages for this agent's name wake the session as they arrive, with no re-arming.",
+  "version": "0.3.0",
+  "description": "Watch PasserJack for the whole session: items you tag for Claude, messages for this agent and the owner's words from the Agents page wake the session as they arrive, and the Agents page sees when this session waits for you.",
   "author": {
     "name": "Jack Neil"
   },
   "homepage": "https://passerjack.com",
   "repository": "https://github.com/jackneil/passerjack-plugin",
-  "keywords": ["passerjack", "clipboard", "inbox", "monitor"]
+  "keywords": ["passerjack", "clipboard", "inbox", "monitor", "hooks"]
 }

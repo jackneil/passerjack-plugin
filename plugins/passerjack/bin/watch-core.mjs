@@ -257,7 +257,7 @@ function clip(value, max) {
  * the remote to its slug, a detached `HEAD` to nothing. Absent fields are
  * left out rather than sent as null.
  *
- * @typedef {{ host: string, harness: string, name?: string, repo?: string, cwd?: string, branch?: string, clientId?: string }} SessionBody
+ * @typedef {{ host: string, harness: string, name?: string, repo?: string, cwd?: string, branch?: string, clientId?: string, waits?: boolean }} SessionBody
  * @param {Record<string, string | undefined> | undefined} env
  * @param {{ hostname?: unknown, cwd?: unknown, remote?: unknown, branch?: unknown, clientId?: unknown } | undefined} facts
  * @returns {SessionBody}
@@ -275,7 +275,25 @@ export function sessionBody(env, facts) {
   const branch = f.branch === "HEAD" ? null : clip(f.branch, MAX_BRANCH_CHARS);
   if (branch) body.branch = branch;
   if (typeof f.clientId === "string" && UUID_RE.test(f.clientId)) body.clientId = f.clientId;
+  // The plugin's hooks report this session's turn ends (`hooks/hooks.json`),
+  // so the server pushes an open question only after the minute of silence.
+  // Only when the hooks can find this watcher's session (`CLAUDE_PID`, the
+  // link key): without it they post nothing, and a session that said it
+  // waits would never push a question at all.
+  if (claudeKey(env)) body.waits = true;
   return body;
+}
+
+/**
+ * The Claude Code process id this process runs under (`CLAUDE_PID`), or null
+ * when the environment does not say. It is the key that links the watcher to
+ * the plugin's hooks of the same session (`session-link.mjs`): a monitor and a
+ * hook of one Claude Code process both carry it, with the same value, and a
+ * `/clear` does not change it.
+ */
+export function claudeKey(env) {
+  const raw = String(env?.CLAUDE_PID ?? "").trim();
+  return /^[1-9][0-9]{0,9}$/.test(raw) ? raw : null;
 }
 
 /** The session id out of a registration answer, or null for anything not shaped like one. */
@@ -415,14 +433,42 @@ export function doorbellLine(bell) {
   return `${LINE_PREFIX} new ${kind} "${name}"${sizeText} tagged ${tag}, from ${sender}, item ${shortId(b.itemId)}`;
 }
 
-/** The server's `messageBellLine`, over an agent-message frame's JSON. */
-export function messageBellLine(bell) {
+/** The server's `OWNER_TARGET_NAME` (`src/lib/agent-conversation-rules.ts`): the `to` of an owner message from the Agents page. */
+export const OWNER_TARGET_NAME = "@session";
+
+/**
+ * Who an OWNER message is for, by session id, never by the shared name
+ * `@session`: two terminals in one folder, or a model that lost its session
+ * id to a compaction, must not act on (and ack) words typed for another
+ * session. The frame's `targetSessionId` (a newer server sends it) names the
+ * session; when it is this watcher's own, or when the frame has none (an
+ * older server, which rings an owner message on its target session's watch
+ * only), it is THIS session.
+ */
+function ownerAudience(target, ownSessionId) {
+  const own = typeof ownSessionId === "string" && UUID_RE.test(ownSessionId) ? ownSessionId.toLowerCase() : null;
+  const named = typeof target === "string" && UUID_RE.test(target) ? target.toLowerCase() : null;
+  if (named && named !== own) return `for session ${shortId(named)}`;
+  if (own) return `for this session ${shortId(own)}`;
+  return `for ${quoted(OWNER_TARGET_NAME)}`;
+}
+
+/**
+ * The server's `messageBellLine`, over an agent-message frame's JSON. An
+ * owner message names its session instead (`ownerAudience`): `ownSessionId`
+ * is the session this watch carries.
+ *
+ * @param {any} bell
+ * @param {string | null} [ownSessionId]
+ */
+export function messageBellLine(bell, ownSessionId = null) {
   const b = bell ?? {};
   const subject = oneLine(b.subject);
   const subjectText = subject ? `, subject ${quoted(subject)}` : "";
   const to = oneLine(b.to, 32) ?? "?";
   const from = oneLine(b.from, 120) ?? "somebody";
-  return `${LINE_PREFIX} message ${shortId(b.messageId)} for ${quoted(to)} from ${quoted(from)}${subjectText}`;
+  const audience = to === OWNER_TARGET_NAME ? ownerAudience(b.targetSessionId, ownSessionId) : `for ${quoted(to)}`;
+  return `${LINE_PREFIX} message ${shortId(b.messageId)} ${audience} from ${quoted(from)}${subjectText}`;
 }
 
 /** The server's `catchupLine`. */
@@ -470,9 +516,14 @@ export function messageBurstLine(n, to) {
  * What one dispatched frame prints, or null for a frame that prints nothing
  * (`watching`, anything unknown, anything unparseable). `ring` is a doorbell
  * or a message, which goes through the burst window; `catchup` prints at once,
- * as it does on the server.
+ * as it does on the server. `sessionId` is the session the feed carries, which
+ * an owner message's line names.
+ *
+ * @param {any} lane
+ * @param {any} frame
+ * @param {string | null} [sessionId]
  */
-export function lineForFrame(lane, frame) {
+export function lineForFrame(lane, frame, sessionId = null) {
   let data;
   try {
     data = JSON.parse(frame.data);
@@ -484,7 +535,7 @@ export function lineForFrame(lane, frame) {
     return { kind: "ring", line: doorbellLine(data) };
   }
   if (lane.kind === "messages" && frame.event === "agent-message") {
-    return { kind: "ring", line: messageBellLine(data) };
+    return { kind: "ring", line: messageBellLine(data, sessionId) };
   }
   if (lane.kind === "messages" && frame.event === "all-passed") {
     return { kind: "ring", line: allPassedLine(data) };
@@ -598,6 +649,23 @@ export class OutageMemo {
     this.announced = false;
     return `${LINE_PREFIX} watch back online`;
   }
+}
+
+/**
+ * WHEN THE `registered` LINE IS PRINTED AGAIN (dcr wave 1 P8). The line gives
+ * the agent this session's id, which a compaction can take from its context.
+ * But every line the watcher prints is a notification that wakes the session,
+ * and the watcher reconnects about every fourteen minutes on the server's
+ * goodbye. So: `new-id` (a new row) always; `back-online` (after an outage
+ * that the watcher announced) yes, beside the back-online line that wakes the
+ * session anyway; `reconnect` (the routine re-arm) never. An owner message's
+ * own line carries the session id (`messageBellLine`), so the agent never
+ * needs this line to answer one.
+ *
+ * @param {"new-id" | "back-online" | "reconnect"} reason
+ */
+export function reprintsRegistered(reason) {
+  return reason === "new-id" || reason === "back-online";
 }
 
 /** The line a 401 prints before the watcher exits, for a key from `PASSERJACK_API_KEY`. */

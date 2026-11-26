@@ -181,6 +181,72 @@ export function readCredentials(file) {
 export function writeCredentials(file, cred, platform = process.platform) {
   const parsed = parseCredential(cred);
   if (!parsed) throw new Error("not a credential");
+  writeJsonAtomic(file, parsed, { platform, indent: 2 });
+  return parsed;
+}
+
+/**
+ * Remove a small JSON file only when `owned(content)` says it is the caller's,
+ * with no window in which another writer's newer file is removed. The file is
+ * first MOVED aside (one rename, so the file read is the file removed: a read
+ * and then a remove could remove a file that another process wrote between
+ * the two). A file that is not the caller's is put back with a hard link,
+ * which never replaces a newer file written in the meantime. Synchronous, so
+ * it can run in a process's `exit` handler. Never throws. The second place in
+ * the plugin that renames a file, beside `writeJsonAtomic`, and for the same
+ * reason (the source guard in `passerjack-plugin-hooks.test.ts`).
+ *
+ * @param {string} file
+ * @param {(content: unknown) => boolean} owned
+ */
+export function removeJsonIfOwned(file, owned) {
+  const aside = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  try {
+    fs.renameSync(file, aside);
+  } catch {
+    return;
+  }
+  let content = null;
+  try {
+    const text = fs.readFileSync(aside, "utf8");
+    content = text.length > 4096 ? null : JSON.parse(text);
+  } catch {
+    content = null;
+  }
+  if (!owned(content)) {
+    try {
+      fs.linkSync(aside, file);
+    } catch {
+      // A newer file is there now, or the folder refuses hard links.
+    }
+  }
+  try {
+    fs.rmSync(aside, { force: true });
+  } catch {
+    // A `.tmp` left behind is swept by its owner's sweep.
+  }
+}
+
+/**
+ * THE ONE ATOMIC WRITE of every small private file that the plugin and the
+ * agent bridge keep: the credentials file, a session link, the hooks' state
+ * and a bridge state file. `value` goes to a new temporary file beside
+ * `file` (made with O_EXCL, mode 0600, synced to disk). Then a rename puts it
+ * over `file`, so a reader sees the old file or the new one and never half of
+ * one. A rename that Windows refuses for a moment is tried again
+ * (`renameWithRetry`). When anything fails, the temporary file is removed and
+ * the error is thrown: a caller that records something must not act as if
+ * the record landed.
+ *
+ * The folder is made 0700, and tightened only when this call made it. The
+ * temporary file is `.<name>.<pid>.<random>.tmp`, the shape that
+ * `removeLeftoverTemps` and the sweeps look for.
+ *
+ * @param {string} file
+ * @param {unknown} value
+ * @param {{ platform?: string, indent?: number }} [options]
+ */
+export function writeJsonAtomic(file, value, { platform = process.platform, indent = 0 } = {}) {
   const dir = path.dirname(file);
   const created = fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   if (platform !== "win32" && created !== undefined) fs.chmodSync(dir, 0o700);
@@ -188,7 +254,7 @@ export function writeCredentials(file, cred, platform = process.platform) {
   try {
     const fd = fs.openSync(temp, "wx", 0o600);
     try {
-      fs.writeFileSync(fd, `${JSON.stringify(parsed, null, 2)}\n`);
+      fs.writeFileSync(fd, `${indent ? JSON.stringify(value, null, indent) : JSON.stringify(value)}\n`);
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
@@ -199,7 +265,6 @@ export function writeCredentials(file, cred, platform = process.platform) {
     fs.rmSync(temp, { force: true });
     throw err;
   }
-  return parsed;
 }
 
 /** How long a rename may keep being refused before the write fails. */
@@ -277,6 +342,61 @@ export function fingerprint(cred) {
 /** The token a request carries for this credential. */
 export function bearerOf(cred) {
   return cred.kind === "oauth" ? cred.accessToken : cred.apiKey;
+}
+
+/**
+ * What stays the same for one sign-in while its tokens rotate: the OAuth
+ * client and the `connection` id, or a NAMESPACED hash of the key. NEVER
+ * `fingerprint` (that changes at every refresh), never a token or a key in
+ * clear, and never the bare sha256 of a key, which is the value the server
+ * stores for that key: the presence `clientId` is made from this
+ * (`sessionClientId` in `session-link.mjs`).
+ *
+ * @param {{ kind: "env", key: string } | { kind: "oauth" | "key" } & Record<string, string>} cred
+ */
+export function signInIdentity(cred) {
+  const hash = (text) => crypto.createHash("sha256").update(`passerjack-sign-in\0${text}`).digest("hex");
+  if (cred.kind === "env") return `env:${hash(cred.key)}`;
+  if (cred.kind === "key") return `key:${hash(cred.apiKey)}`;
+  return `oauth:${cred.clientId}:${cred.connection ?? ""}`;
+}
+
+/** An access token with less than this left is never sent by a short hook process. */
+export const HOOK_TOKEN_MARGIN_MS = 30_000;
+
+/**
+ * The credential of the plugin's hooks and of the agent bridge:
+ * `PASSERJACK_API_KEY` in the environment wins (`{ kind: "env", key }`),
+ * else the saved sign-in for `origin` (`{ kind, cred, file }`), else null.
+ * The file is the one `credentialsPath` names, and nothing else.
+ *
+ * @param {Record<string, string | undefined>} env
+ * @param {string} origin
+ */
+export function loadAuth(env, origin) {
+  const key = (env?.PASSERJACK_API_KEY ?? "").trim();
+  if (key) return { kind: "env", key };
+  const file = credentialsPath();
+  const cred = readCredentials(file);
+  if (!cred || cred.origin !== origin) return null;
+  return { kind: cred.kind, cred, file };
+}
+
+/**
+ * The bearer that a SHORT HOOK PROCESS may send now, or null. It NEVER
+ * refreshes: a hook can be killed at any moment, and a refresh whose rotated
+ * pair it could not save spends the refresh token for nothing (the next
+ * refresh is a replay that ends the connection). It uses the access token
+ * that the watcher (or a bridge worker) keeps fresh. An access token with
+ * less than `HOOK_TOKEN_MARGIN_MS` left counts as none.
+ *
+ * @param {ReturnType<typeof loadAuth>} auth
+ */
+export function hookBearer(auth, now = Date.now()) {
+  if (!auth) return null;
+  if (auth.kind === "env") return auth.key;
+  if (auth.cred.kind === "key") return auth.cred.apiKey;
+  return Date.parse(auth.cred.accessExpiresAt) - now > HOOK_TOKEN_MARGIN_MS ? auth.cred.accessToken : null;
 }
 
 /** One endpoint of `cred`, the saved one or the server's fixed path, on the credential's own origin. */
