@@ -17,7 +17,17 @@
  * the session only ever wakes for something that arrived.
  *
  * THE CREDENTIAL. `PASSERJACK_API_KEY` from the environment wins when it is
- * set (see `readConfig`). Otherwise the credentials file that
+ * set (see `readConfig`), BUT NOT OVER ANOTHER ACCOUNT (D8, #787i, plugin
+ * 0.4.0): when the credentials file also holds a sign-in for this origin,
+ * the watcher asks `GET /api/me` with each, at start and whenever that
+ * sign-in changes. Different accounts: it registers nothing, writes no link
+ * (so every hook does nothing) and prints ONE line, `ACCOUNTS_DIFFER_LINE`.
+ * The same account: the key runs the watch, and the link carries the
+ * remote-answer mark, so the request hook may take the owner's answers. A
+ * key with no saved sign-in runs the watch with NO mark: messages and status
+ * work, and every permission prompt stays at the terminal, so a repository
+ * that sets the key cannot press Allow on this computer from another
+ * account. A saved sign-in alone always carries the mark. Otherwise the credentials file that
  * `/passerjack:connect` writes (`credentials.mjs`): a browser sign-in, whose
  * access token this process refreshes before it expires and on a 401, under a
  * lock shared by every session on the machine, or a key saved with `--paste`.
@@ -60,7 +70,9 @@ import {
   credentialsPath,
   fingerprint,
   needsRefresh,
+  readAccount,
   readCredentials,
+  remoteMark,
   renewCredential,
   requestRefresh,
   sameSignIn,
@@ -69,6 +81,7 @@ import {
 import { findOnPath, safeCwd } from "./programs.mjs";
 import { claudeKey, linkedElsewhere, linkHolder, linksDir, processAlive, removeLink, sessionClientId, sweepLinks, writeLink } from "./session-link.mjs";
 import {
+  ACCOUNTS_DIFFER_LINE,
   BurstWindow,
   IDLE_TIMEOUT_MS,
   KEY_REFUSED_LINE,
@@ -94,7 +107,7 @@ import {
   sessionIdFrom,
 } from "./watch-core.mjs";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 
 /**
  * Where this watcher tells the plugin's hooks which session it holds
@@ -154,20 +167,25 @@ function requestHeaders(token) {
 /**
  * A key from `PASSERJACK_API_KEY`. It cannot be renewed, and a 401 on it keeps
  * the behaviour it always had: say so once and exit (`stopOnDeadKey`).
+ * `remote` is its remote-answer mark when the watcher proved that the saved
+ * sign-in is of the same account, else null (D8). Its watch stops only with
+ * `different`: the saved sign-in changed to another account.
  */
 class EnvAuth {
-  constructor(key) {
+  constructor(key, remote = null) {
     this.key = key;
     this.kind = "env";
     this.identity = signInIdentity({ kind: "env", key });
+    this.remote = remote;
     this.dead = false;
     this.stopReason = null;
-    this.signal = new AbortController().signal;
+    this.controller = new AbortController();
+    this.signal = this.controller.signal;
     this.inFlight = null;
   }
 
   get stopped() {
-    return false;
+    return this.stopReason !== null;
   }
 
   async bearer() {
@@ -182,7 +200,11 @@ class EnvAuth {
     return "dead";
   }
 
-  stop() {}
+  stop(reason) {
+    if (this.stopReason !== null) return;
+    this.stopReason = reason;
+    this.controller.abort();
+  }
 }
 
 /**
@@ -212,6 +234,8 @@ class FileAuth {
     this.kind = cred.kind;
     /** The sign-in this watch runs on; a rotated pair keeps it, a new sign-in is a new watch. */
     this.identity = signInIdentity(cred);
+    /** The saved sign-in is the bearer, so the request hook may take the owner's answers (D8). */
+    this.remote = remoteMark(this.identity);
     this.dead = false;
     this.stopReason = null;
     this.controller = new AbortController();
@@ -512,7 +536,7 @@ class Presence {
   relink() {
     if (this.id === this.linkedId) return;
     if (this.id) {
-      this.linkWritten(writeLink({ dir: LINKS_DIR, key: CLAUDE_KEY, sessionId: this.id, origin: this.config.origin, watcherPid: process.pid }));
+      this.linkWritten(writeLink(this.linkFor(this.id)));
     } else {
       // Only this watcher's own link: another watcher of the same Claude Code
       // process (a plugin reload) may hold the file now.
@@ -530,8 +554,23 @@ class Presence {
   ensureLink() {
     if (!this.id || !CLAUDE_KEY) return;
     const held = linkHolder(LINKS_DIR, CLAUDE_KEY);
-    if (held && held.sessionId === this.id && (held.watcherPid === process.pid || processAlive(held.watcherPid))) return;
-    this.linkWritten(writeLink({ dir: LINKS_DIR, key: CLAUDE_KEY, sessionId: this.id, origin: this.config.origin, watcherPid: process.pid }));
+    if (held && held.sessionId === this.id && (held.watcherPid === process.pid || processAlive(held.watcherPid))) {
+      // This watcher's own link keeps its remote-answer mark in step (D8).
+      if (held.watcherPid !== process.pid || held.remote === (this.auth.remote ?? null)) return;
+    }
+    this.linkWritten(writeLink(this.linkFor(this.id)));
+    this.linkedId = this.id;
+  }
+
+  /** The link for session `id`: this watcher, and the remote-answer mark of its bearer or none (D8). */
+  linkFor(id) {
+    return { dir: LINKS_DIR, key: CLAUDE_KEY, sessionId: id, origin: this.config.origin, watcherPid: process.pid, remote: this.auth.remote ?? null };
+  }
+
+  /** The remote-answer mark changed (the saved sign-in changed): write the link again at once. */
+  refreshLink() {
+    if (this.disabled || !this.id || !CLAUDE_KEY) return;
+    this.linkWritten(writeLink(this.linkFor(this.id)));
     this.linkedId = this.id;
   }
 
@@ -873,12 +912,13 @@ async function waitForSignIn(file, origin, refused) {
  * the same sign-in, and a NEW one for a new sign-in, which may be another
  * account (the server refuses a `clientId` that another credential holds).
  */
-async function watchWith(config, auth, facts, current) {
+async function watchWith(config, auth, facts, current, saved = null) {
   const clientId = sessionClientId(process.env, { origin: config.origin, identity: auth.identity });
   const presence = new Presence(config, auth, sessionBody(process.env, { ...facts, clientId }));
   current.presence = presence;
   current.auth = auth;
   if (auth instanceof FileAuth) auth.watchFile(config.origin);
+  const savedTimer = auth instanceof EnvAuth && saved ? watchSavedSignIn(config, auth, presence, saved) : null;
   const linkTimer = setInterval(() => presence.tick(), SIGN_IN_POLL_MS);
   linkTimer.unref?.();
   try {
@@ -890,9 +930,105 @@ async function watchWith(config, auth, facts, current) {
     presence.leave();
   } finally {
     clearInterval(linkTimer);
+    if (savedTimer) clearInterval(savedTimer);
     if (auth instanceof FileAuth) auth.unwatchFile();
   }
   return auth.stopReason ?? "stopped";
+}
+
+/**
+ * D8: which account the environment's key and the saved sign-in belong to.
+ * Answers `alone` (no saved sign-in for this origin, or one that the server
+ * refused), `same` with the saved sign-in's `identity`, `different`,
+ * `dead-key` (the server refused the key: today's line and exit) or
+ * `unknown` (no answer yet: ask again later). Only `same` ever gives the
+ * request hook the owner's answers. `holder.auth` keeps ONE `FileAuth` for
+ * the saved sign-in, so a token that has run out is renewed under the
+ * machine's lock (never a second spend of one refresh token), and a pair the
+ * file could not take stays in memory for the next renewal.
+ */
+async function compareAccounts(config, file, holder) {
+  const cred = readCredentials(file);
+  if (!cred || cred.origin !== config.origin) {
+    holder.auth = null;
+    return { kind: "alone" };
+  }
+  const userAgent = `passerjack-claude-plugin/${VERSION}`;
+  const key = await readAccount(config.origin, config.key, { userAgent });
+  if (key.kind === "refused" && key.status === 401) return { kind: "dead-key" };
+  // A key that may not read the account: the lanes say what the server says,
+  // and the key gets no remote answers.
+  if (key.kind === "refused") return { kind: "alone" };
+  if (key.kind !== "ok") return { kind: "unknown" };
+  if (!holder.auth || holder.auth.stopReason === "replaced" || holder.auth.stopReason === "signed-out" || !sameSignIn(holder.auth.cred, cred)) {
+    holder.auth = new FileAuth(file, cred);
+  }
+  const auth = holder.auth;
+  if (auth.stopped) return auth.stopReason === "refused" ? { kind: "alone" } : { kind: "unknown" };
+  let token = await auth.bearer();
+  let account = auth.stopped ? null : await readAccount(config.origin, token, { userAgent });
+  if (account?.kind === "refused" && account.status === 401) {
+    const renewed = await auth.recover(token);
+    if (renewed === "transient") return { kind: "unknown" };
+    token = auth.token();
+    account = auth.stopped ? null : await readAccount(config.origin, token, { userAgent });
+  }
+  if (auth.stopped) return auth.stopReason === "refused" ? { kind: "alone" } : { kind: "unknown" };
+  if (!account || account.kind === "transient") return { kind: "unknown" };
+  // A saved key that the server refused is no sign-in.
+  if (account.kind === "refused") return { kind: "alone" };
+  return account.id === key.id ? { kind: "same", identity: auth.identity } : { kind: "different" };
+}
+
+/**
+ * D8 while the key's watch runs: one `stat` of the credentials file every few
+ * seconds. A rotated pair of the sign-in already compared changes nothing. A
+ * new sign-in, or one that went, is compared again, with NO remote answers
+ * until the answer is in: `same` writes the mark into the link, `alone` takes
+ * it out, `different` stops the watch (the caller prints the one line), and
+ * `unknown` asks again on the next tick.
+ */
+function watchSavedSignIn(config, auth, presence, saved) {
+  let stamp = statStamp(saved.file);
+  let due = false;
+  let busy = false;
+  const setRemote = (mark) => {
+    if (auth.remote === mark) return;
+    auth.remote = mark;
+    presence.refreshLink();
+  };
+  const timer = setInterval(async () => {
+    const now = statStamp(saved.file);
+    if (now !== stamp) {
+      stamp = now;
+      const cred = now === "missing" ? null : readCredentials(saved.file);
+      const usable = cred && cred.origin === config.origin ? cred : null;
+      // A rotated pair (or a stat that changed for nothing) of the same sign-in.
+      if ((usable ? signInIdentity(usable) : null) !== saved.identity || due) due = true;
+    }
+    if (!due || busy || auth.stopped) return;
+    busy = true;
+    try {
+      setRemote(null);
+      const verdict = await compareAccounts(config, saved.file, saved.holder);
+      if (verdict.kind === "unknown" || auth.stopped) return;
+      due = false;
+      if (verdict.kind === "different") return auth.stop("different");
+      saved.identity = verdict.kind === "same" ? verdict.identity : null;
+      setRemote(verdict.kind === "same" ? remoteMark(auth.identity) : null);
+    } catch {
+      // Asked again on the next tick.
+    } finally {
+      busy = false;
+    }
+  }, SIGN_IN_POLL_MS);
+  timer.unref?.();
+  return timer;
+}
+
+/** Wait until the credentials file's `stat` is not `stamp` any more. */
+async function fileChanged(file, stamp) {
+  while (statStamp(file) === stamp) await sleep(SIGN_IN_POLL_MS);
 }
 
 /** Resolve after `promise` or after `ms`, whichever is first. Never rejects. */
@@ -934,14 +1070,43 @@ async function main() {
   };
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, stop);
 
-  if (config.key) {
-    // The environment wins, and behaves exactly as it always has.
-    await watchWith(config, new EnvAuth(config.key), facts, current);
-    return;
-  }
-
   // The home folder alone decides the place: no environment variable moves it.
   const file = credentialsPath();
+
+  if (config.key) {
+    // The environment wins, but never over ANOTHER account (D8).
+    const holder = { auth: null };
+    let said = false;
+    let attempt = 0;
+    for (;;) {
+      const stamp = statStamp(file);
+      const verdict = await compareAccounts(config, file, holder);
+      if (verdict.kind === "dead-key") return stopOnDeadKey();
+      if (verdict.kind === "unknown") {
+        // No answer yet: nothing is registered until the accounts are known.
+        await sleep(backoffMs(attempt));
+        attempt += 1;
+        continue;
+      }
+      attempt = 0;
+      if (verdict.kind === "different") {
+        if (!said) print(ACCOUNTS_DIFFER_LINE);
+        said = true;
+        await fileChanged(file, stamp);
+        continue;
+      }
+      said = false;
+      const auth = new EnvAuth(config.key, verdict.kind === "same" ? remoteMark(signInIdentity({ kind: "env", key: config.key })) : null);
+      const saved = { file, holder, identity: verdict.kind === "same" ? verdict.identity : null };
+      const outcome = await watchWith(config, auth, facts, current, saved);
+      current.presence = null;
+      current.auth = null;
+      // The saved sign-in changed to another account: the next pass says so.
+      if (outcome === "different") continue;
+      return;
+    }
+  }
+
   let cred = readCredentials(file);
   if (!cred || cred.origin !== config.origin) {
     // ONE line. After a stopped line below, nothing more is printed while it

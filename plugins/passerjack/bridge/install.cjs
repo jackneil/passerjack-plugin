@@ -69,6 +69,15 @@ const MARK = path.join("agent-bridge", "bridge", "bridge.mjs");
 /** `DEFAULT_ORIGIN` of `bin/watch-core.mjs`, pinned by the same test. */
 const DEFAULT_ORIGIN = "https://passerjack.com";
 
+/**
+ * The timeout of Codex's PermissionRequest hook, in seconds:
+ * `AWAY_HOOK_TIMEOUT_S` of `bridge/harnesses.mjs`, pinned by the same test.
+ * While the owner's "I'm away" switch is on, the hook waits for the owner's
+ * answer and stops 30 seconds before this. Codex records trust against a
+ * hook's hash, so a changed timeout needs a new trust in `/hooks`.
+ */
+const AWAY_HOOK_TIMEOUT_S = 3600;
+
 function stop(line) {
   say(line);
   process.exit(1);
@@ -145,7 +154,8 @@ const TARGETS = {
       SessionStart: claudeGroup("codex", "SessionStart", 10),
       UserPromptSubmit: claudeGroup("codex", "UserPromptSubmit", 10),
       Stop: claudeGroup("codex", "Stop", 15),
-      PermissionRequest: claudeGroup("codex", "PermissionRequest", 10),
+      // Waits for the owner's answer only while "I'm away" is on; else one 3 s read.
+      PermissionRequest: claudeGroup("codex", "PermissionRequest", AWAY_HOOK_TIMEOUT_S),
       // "SessionEnd ... support up to 3 seconds".
       SessionEnd: claudeGroup("codex", "SessionEnd", 3),
     }),
@@ -181,7 +191,9 @@ const TARGETS = {
     file: () => p(".junie", "config.json"),
     container: ["hooks"],
     seed: {},
-    // Never PermissionRequest: with no decision, Junie approves the action.
+    // No PermissionRequest until a live walk: an exit 0 with no decision
+    // approves the action. The bridge's adapter exits 1 for "no decision",
+    // but the hook timeout and the dialog during the hook are not proven.
     events: () => ({
       SessionStart: claudeGroup("junie", "SessionStart", 10),
       UserPromptSubmit: claudeGroup("junie", "UserPromptSubmit", 10),
@@ -194,6 +206,8 @@ const TARGETS = {
     file: () => p(".config", "devin", "config.json"),
     container: ["hooks"],
     seed: {},
+    // No PermissionRequest until a live walk: what "no decision" does there is
+    // implied by the documentation's example only.
     events: () => ({
       SessionStart: claudeGroup("devin", "SessionStart", 10),
       UserPromptSubmit: claudeGroup("devin", "UserPromptSubmit", 10),
@@ -766,5 +780,5 @@ if (require.main === module) {
   }
 } else {
   // Loaded by a test (never by a person): the copies it pins, and nothing runs.
-  module.exports = { placesFor, DEFAULT_ORIGIN, unsafeInQuotes, withoutOurs };
+  module.exports = { placesFor, DEFAULT_ORIGIN, AWAY_HOOK_TIMEOUT_S, unsafeInQuotes, withoutOurs };
 }

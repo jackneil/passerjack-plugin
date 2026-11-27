@@ -361,6 +361,71 @@ export function signInIdentity(cred) {
   return `oauth:${cred.clientId}:${cred.connection ?? ""}`;
 }
 
+/**
+ * The sign-in identity of a `loadAuth` answer (`signInIdentity`), or null for
+ * none: the environment's key, or the saved sign-in that the file holds.
+ *
+ * @param {ReturnType<typeof loadAuth>} auth
+ */
+export function authIdentity(auth) {
+  if (!auth) return null;
+  return auth.kind === "env" ? signInIdentity(auth) : signInIdentity(auth.cred);
+}
+
+/**
+ * THE REMOTE-ANSWER MARK (design `docs/plans/2026-11-26-remote-permission/
+ * design.html`, D8). The watcher writes it in the session link only for a
+ * bearer that may get the owner's answers to a permission prompt: the saved
+ * sign-in, or an environment key whose account the watcher proved to be the
+ * saved sign-in's account. The request hook takes part only when the mark of
+ * ITS bearer is the link's mark. A namespaced sha256 of the identity, so the
+ * link holds no key, no token and no bare hash of a key.
+ *
+ * @param {string | null} identity
+ */
+export function remoteMark(identity) {
+  if (!identity) return null;
+  return crypto.createHash("sha256").update(`passerjack-remote\0${identity}`).digest("hex");
+}
+
+/** The longest one account check (`readAccount`) may take. */
+export const ACCOUNT_TIMEOUT_MS = 10_000;
+
+/**
+ * Which account a bearer belongs to: one `GET /api/me`, which answers the
+ * caller's own `id`. Answers `{ kind: "ok", id }`, `{ kind: "refused", status }`
+ * (401 or 403) or `{ kind: "transient" }` (no answer, a 429, a 5xx, a page that
+ * is not the account). The id is compared and never printed.
+ *
+ * @param {string} origin
+ * @param {string} token
+ * @param {{ fetchImpl?: typeof fetch, userAgent?: string }} [options]
+ */
+export async function readAccount(origin, token, { fetchImpl = fetch, userAgent = "passerjack-claude-plugin" } = {}) {
+  let res;
+  try {
+    res = await fetchImpl(new URL("/api/me", origin), {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json", "user-agent": userAgent },
+      redirect: "error",
+      signal: AbortSignal.timeout(ACCOUNT_TIMEOUT_MS),
+    });
+  } catch {
+    return { kind: "transient" };
+  }
+  if (res.status === 401 || res.status === 403) {
+    await res.body?.cancel().catch(() => {});
+    return { kind: "refused", status: res.status };
+  }
+  let body = null;
+  try {
+    body = await res.json();
+  } catch {
+    // Not JSON.
+  }
+  const id = body && typeof body === "object" ? body.id : null;
+  return res.ok && typeof id === "string" && id.length > 0 ? { kind: "ok", id } : { kind: "transient" };
+}
+
 /** An access token with less than this left is never sent by a short hook process. */
 export const HOOK_TOKEN_MARGIN_MS = 30_000;
 

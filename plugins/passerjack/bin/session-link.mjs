@@ -20,6 +20,13 @@
  * (`credentialsPath`), 0700, each file 0600, written by a rename so a hook
  * never reads half a file. A hook that finds no file, or a file whose
  * watcher has exited, does nothing.
+ *
+ * THE REMOTE-ANSWER MARK (plugin 0.4.0, design
+ * `docs/plans/2026-11-26-remote-permission/design.html`, D8): `remote` is
+ * `remoteMark` (`credentials.mjs`) of the bearer that the watcher proved may
+ * get the owner's answers to a permission prompt, or absent. The request hook
+ * takes part only when the mark of its own bearer is this mark. A link of a
+ * 0.3.0 watcher has no mark, so its hooks get no remote answers.
  */
 
 import crypto from "node:crypto";
@@ -32,6 +39,8 @@ import { claudeKey } from "./watch-core.mjs";
 export { claudeKey };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A remote-answer mark: a sha256 in hex (`remoteMark`). */
+const MARK_RE = /^[0-9a-f]{64}$/;
 
 /** Link files older than this are a session that ended without saying so, and the watcher sweeps them. */
 export const STALE_LINK_MS = 2 * 24 * 60 * 60 * 1000;
@@ -47,10 +56,10 @@ export function linkPath(dir, key) {
 }
 
 /** Read a small JSON file, or null. */
-function readJson(file) {
+function readJson(file, maxChars = 4096) {
   try {
     const text = fs.readFileSync(file, "utf8");
-    if (text.length > 4096) return null;
+    if (text.length > maxChars) return null;
     return JSON.parse(text);
   } catch {
     return null;
@@ -64,13 +73,18 @@ function readJson(file) {
  * its hooks find no session and would never post the idle that releases a
  * held question push.
  *
- * @param {{ dir: string, key: string | null, sessionId: string, origin: string, watcherPid: number }} link
+ * `remote` is the remote-answer mark of the watcher's bearer, or null when
+ * that bearer gets no remote answers (D8).
+ *
+ * @param {{ dir: string, key: string | null, sessionId: string, origin: string, watcherPid: number, remote?: string | null }} link
  * @returns {boolean}
  */
-export function writeLink({ dir, key, sessionId, origin, watcherPid }) {
+export function writeLink({ dir, key, sessionId, origin, watcherPid, remote = null }) {
   if (!key || !UUID_RE.test(sessionId)) return false;
+  const value = { v: 1, sessionId: sessionId.toLowerCase(), origin, watcherPid };
+  if (typeof remote === "string" && MARK_RE.test(remote)) value.remote = remote;
   try {
-    writeJsonAtomic(linkPath(dir, key), { v: 1, sessionId: sessionId.toLowerCase(), origin, watcherPid });
+    writeJsonAtomic(linkPath(dir, key), value);
     return true;
   } catch {
     // No link: the hooks do nothing, and the watch goes on.
@@ -142,7 +156,12 @@ export function linkHolder(dir, key) {
   if (!key) return null;
   const link = readJson(linkPath(dir, key));
   if (!link || link.v !== 1 || typeof link.sessionId !== "string" || !Number.isSafeInteger(link.watcherPid)) return null;
-  return { sessionId: link.sessionId, watcherPid: link.watcherPid };
+  return { sessionId: link.sessionId, watcherPid: link.watcherPid, remote: remoteOf(link) };
+}
+
+/** A link's remote-answer mark, or null. */
+function remoteOf(link) {
+  return typeof link.remote === "string" && MARK_RE.test(link.remote) ? link.remote : null;
 }
 
 /** A Claude Code session id as the environment carries it: one short printable line. */
@@ -194,7 +213,7 @@ export function readLink(dir, key, alive) {
   if (!link || link.v !== 1 || typeof link.sessionId !== "string" || !UUID_RE.test(link.sessionId)) return null;
   if (typeof link.origin !== "string" || !Number.isSafeInteger(link.watcherPid)) return null;
   if (!alive(link.watcherPid)) return null;
-  return { sessionId: link.sessionId, origin: link.origin, watcherPid: link.watcherPid };
+  return { sessionId: link.sessionId, origin: link.origin, watcherPid: link.watcherPid, remote: remoteOf(link) };
 }
 
 /** Whether a process id names a running process. */
@@ -212,14 +231,35 @@ export function processAlive(pid) {
  * THE HOOKS' OWN STATE of one Claude Code process, `<CLAUDE_PID>.hooks.json`
  * beside the link (design section 6; dcr wave 1 P4 and P5). The hooks write
  * it, under its lock, and the watcher never does, so a relink cannot wipe it.
- * No credential, no text: a counter and one mark.
+ * No credential, no text: a counter, one mark and the live request hooks.
  *   - `turn`: bumped by every prompt and every session start (a `/clear`, a
  *     resume, a compaction). A Stop waiter posts `idle` only when it did not
  *     move during its minute, so a late `idle` never overwrites `working`.
- *   - `pending`: the permission prompt that is up, `{ n, at, tool, toolUseId,
- *     posted }`, or null. A finished tool, a prompt, a Stop or a session
- *     start clears it; the waiter of mark `n` posts only while it is still
- *     the mark.
+ *   - `requestTurn` (0.4.0, /dcr wave 1 finding 56): the request hooks' own
+ *     counter. ONLY a prompt that the person typed and a session start that
+ *     is not a compaction (`startup`, `resume`, `clear`) bump it. A turn that
+ *     a monitor line starts (an owner message, a tagged item) and a
+ *     compaction say nothing about a prompt that is up, so they leave a
+ *     waiting request hook alone.
+ *   - `pending`: the permission prompt that the Notification waiter watches,
+ *     `{ n, at, tool, toolUseId, posted }`, or null. A finished tool, a
+ *     prompt, a Stop or a session start clears it; the waiter of mark `n`
+ *     posts only while it is still the mark.
+ *   - `requests` (0.4.0): one entry per running PermissionRequest hook,
+ *     `{ n, pid, toolUseId, call, accepted }`. `accepted` says that the server
+ *     took its request row, so that hook (and not the Notification waiter)
+ *     asks for the push. `call` is a sha256 of the call's tool name and input
+ *     (`callDigest` in `hook-core.mjs`), never the input itself. A finished
+ *     tool clears the entry of its call: by `toolUseId`, and for an entry with
+ *     no id, by `call` (the finished call's name and input, one entry for
+ *     each finished call). A typed prompt, a session start that is not a
+ *     compaction, and a Stop with no live background work clear them all:
+ *     the hook reads a missing entry as "answered at the terminal". Several
+ *     entries can be
+ *     open at once, one per prompt, so one prompt never closes another's
+ *     row. An entry of a hook that no longer runs is dropped at the next
+ *     request hook's write. The request key itself is never here: it stays in
+ *     the hook's memory.
  */
 export function hookStatePath(dir, key) {
   return path.join(dir, `${key}.hooks.json`);
@@ -227,7 +267,9 @@ export function hookStatePath(dir, key) {
 
 /**
  * @typedef {{ n: number, at: number, tool: string | null, toolUseId: string | null, posted: boolean }} PermissionMark
- * @typedef {{ v: 1, turn: number, marks: number, pending: PermissionMark | null }} HookState
+ * @typedef {{ n: number, pid: number, toolUseId: string | null, call: string | null, accepted: boolean }} RequestMark
+ * @typedef {{ pid: number, n: number }} ShellClaim
+ * @typedef {{ v: 1, turn: number, requestTurn: number, marks: number, pending: PermissionMark | null, requests: RequestMark[], claims: ShellClaim[] }} HookState
  */
 
 /**
@@ -236,10 +278,23 @@ export function hookStatePath(dir, key) {
  * @returns {HookState}
  */
 export function newHookState() {
-  return { v: 1, turn: 0, marks: 0, pending: null };
+  return { v: 1, turn: 0, requestTurn: 0, marks: 0, pending: null, requests: [], claims: [] };
 }
 
+/**
+ * The most request entries a state keeps. Each one is a RUNNING hook process
+ * (one per open permission prompt), and a dead hook's entry is dropped at
+ * the next write, so a real session holds a few. The bound is for a file
+ * that was crafted or damaged: the read refuses a file over
+ * `HOOK_STATE_MAX_CHARS`, and that would reset the turn counter too.
+ */
+export const MAX_REQUEST_MARKS = 32;
+/** The longest hooks' state file that is read; `MAX_REQUEST_MARKS` entries fit in it with room to spare. */
+const HOOK_STATE_MAX_CHARS = 16_384;
+
 const TOOL_USE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+/** A call digest: a lowercase sha256 in hex. */
+const CALL_DIGEST_RE = /^[0-9a-f]{64}$/;
 
 /**
  * A parsed hooks' state, repaired field by field.
@@ -251,6 +306,7 @@ export function parseHookState(value) {
   const out = newHookState();
   if (!value || typeof value !== "object" || value.v !== 1) return out;
   if (Number.isSafeInteger(value.turn) && value.turn >= 0) out.turn = value.turn;
+  if (Number.isSafeInteger(value.requestTurn) && value.requestTurn >= 0) out.requestTurn = value.requestTurn;
   if (Number.isSafeInteger(value.marks) && value.marks >= 0) out.marks = value.marks;
   const p = value.pending;
   if (p && typeof p === "object" && Number.isSafeInteger(p.n) && Number.isFinite(p.at)) {
@@ -262,13 +318,33 @@ export function parseHookState(value) {
       posted: p.posted === true,
     };
   }
+  if (Array.isArray(value.requests)) {
+    for (const r of value.requests) {
+      if (out.requests.length >= MAX_REQUEST_MARKS) break;
+      if (!r || typeof r !== "object" || !Number.isSafeInteger(r.n) || !Number.isSafeInteger(r.pid) || r.pid <= 0) continue;
+      out.requests.push({
+        n: r.n,
+        pid: r.pid,
+        toolUseId: typeof r.toolUseId === "string" && TOOL_USE_ID_RE.test(r.toolUseId) ? r.toolUseId : null,
+        call: typeof r.call === "string" && CALL_DIGEST_RE.test(r.call) ? r.call : null,
+        accepted: r.accepted === true,
+      });
+    }
+  }
+  if (Array.isArray(value.claims)) {
+    for (const c of value.claims) {
+      if (out.claims.length >= MAX_REQUEST_MARKS) break;
+      if (!c || typeof c !== "object" || !Number.isSafeInteger(c.pid) || c.pid <= 0 || !Number.isSafeInteger(c.n)) continue;
+      out.claims.push({ pid: c.pid, n: c.n });
+    }
+  }
   return out;
 }
 
 /** The hooks' state of this Claude Code process, or null with no key. Never throws. */
 export function readHookState(dir, key) {
   if (!key) return null;
-  return parseHookState(readJson(hookStatePath(dir, key)));
+  return parseHookState(readJson(hookStatePath(dir, key), HOOK_STATE_MAX_CHARS));
 }
 
 /** The longest a hook waits for the state's lock; a lock older than this much more is a dead hook's. */
@@ -293,7 +369,7 @@ export async function updateHookState(dir, key, fn) {
     return await withLock(
       file,
       async () => {
-        const state = parseHookState(readJson(file));
+        const state = parseHookState(readJson(file, HOOK_STATE_MAX_CHARS));
         const out = fn(state);
         writeJsonAtomic(file, state);
         return out;

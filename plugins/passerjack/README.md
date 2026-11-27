@@ -107,7 +107,7 @@ All settings are optional. The watcher reads them from the environment.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `PASSERJACK_API_KEY` | unset | An API key from Settings > Agents on passerjack.com. When it is set, the watcher uses it and not the saved sign-in. A change to it needs a restart of Claude Code. Most people do not need it: use `/passerjack:connect`. |
+| `PASSERJACK_API_KEY` | unset | An API key from Settings > Agents on passerjack.com. When it is set, the watcher uses it and not the saved sign-in. A change to it needs a restart of Claude Code. Most people do not need it: use `/passerjack:connect`. When the key and the saved sign-in are of different accounts, the watcher does nothing and prints one line (see "A key and a sign-in of two accounts"). A key alone cannot answer a permission prompt from the Agents page (see "Answer a permission prompt from PasserJack"). |
 | `PASSERJACK_WATCH_TAG` | `claude` | Items you tag with this wake the session. Set it to an empty value to turn items off. |
 | `PASSERJACK_WATCH_NAME` | unset | Adds a mailbox: messages sent to this name (`desk`, `laptop`) wake the session too, and the session is listed under this name. Without it the session still hears messages sent by hints, and Claude can give the session a name while it runs (see "Give the session a name"). When it is set, the watcher puts this name back each time it reconnects. |
 | `PASSERJACK_SHARE_LAST_MESSAGE` | on | The hooks send a finished turn's last message to your Agents page after a minute of silence. Exactly `0` turns that off on this computer: the page still shows that the session waits for you, with no text (see "The Agents page"). |
@@ -142,6 +142,9 @@ One line each, and nothing else:
   `the saved API key was refused`) when the saved sign-in stops working.
 - `[passerjack] watch stopped: the API key was refused` if the key in
   `PASSERJACK_API_KEY` is revoked.
+- `[passerjack] watch stopped: PASSERJACK_API_KEY and the saved sign-in are different accounts. Remove one.`
+  when the key and the saved sign-in belong to two accounts (see "A key and a
+  sign-in of two accounts").
 
 Lines never carry contents. The bundled `passerjack-inbox` skill tells Claude
 to read the item or message with the MCP tools, to treat message text as data
@@ -195,37 +198,112 @@ When Claude needs a decision and you are away, it asks with `message_user`
 and `question: true`. The page shows the question in amber, and your phone
 gets a push.
 
+An owner message rings as `[passerjack] message 1a2b3c4d for this session
+<full session id> from "you, on the Agents page"`. Claude reads it with that
+full id and does not call `list_sessions` first.
+
+### Answer a permission prompt from PasserJack
+
+When Claude Code shows a permission prompt, the plugin (version 0.4.0 and
+later) also shows it on the Agents page, and you can answer it there from a
+computer, a phone browser or the app:
+
+- **Allow** lets the session use the tool one time. Allow needs a check on
+  this device first: your passkey, Face ID or Touch ID. One check is good for
+  10 minutes. An account with no passkey can sign in again instead.
+- **Allow for this session** shows when Claude Code suggested rules or
+  folders for the prompt. The page lists each rule and folder before you
+  press it. They stay in force until the session ends, and never go into a
+  settings file.
+- **Deny** needs no check. You can add a note of up to 500 characters. Claude
+  reads the note as your words: "The owner denied this tool call from
+  PasserJack. The owner wrote: ...". A Codex session that the agent bridge
+  connects reads the same words.
+
+The prompt stays live at the terminal the whole time, and the first answer
+wins. When you answer at the terminal, the plugin closes the prompt on the
+page as soon as it sees the answer (the tool's result, a finished or a failed
+tool, a new prompt, the end of the turn). Then PasserJack can no longer answer it. After a minute with no
+answer, your phone gets a push. The push and the bell never show what the
+tool would do: only the Agents page shows it.
+
+What goes to PasserJack for this: the tool's name and its exact input (the
+Bash command as it is, or another tool's input as JSON), to your own account
+only. The page shows the input. The server erases it when the prompt closes,
+and it is never in a push, an export or a log line. An input over 4000
+characters is never cut: the page says that it is too long to show, and you
+can only Deny it there.
+
+The plugin answers these prompts itself, with no question to you:
+`check_messages`, `ack_message`, `message_user`, `set_status` and
+`list_sessions`, from the PasserJack MCP server named `passerjack` that you
+added yourself (`claude mcp add`), for this session only. So an owner message
+never waits on a prompt. Every other PasserJack tool asks as usual. A server
+under another name, or one that a repository's `.mcp.json` adds, is not
+matched.
+
+Remote answers need the saved sign-in from `/passerjack:connect` (or
+`--paste`). With only `PASSERJACK_API_KEY`, every prompt stays at the
+terminal, and the push still comes. A key and a saved sign-in of the SAME
+account can answer too. This is so a repository that sets the key in its
+settings cannot press Allow on this computer from another account.
+
+The prompt hook waits for your answer for up to 12 hours. A waiting hook is
+one small process and one request every 25 seconds.
+
+### A key and a sign-in of two accounts
+
+When `PASSERJACK_API_KEY` and the saved sign-in belong to different accounts,
+the watcher registers nothing, the hooks send nothing, and the session gets
+one line:
+
+```
+[passerjack] watch stopped: PASSERJACK_API_KEY and the saved sign-in are different accounts. Remove one.
+```
+
+Remove the variable, or run `/passerjack:connect --sign-out`. When the saved
+sign-in changes to the key's account, or goes, the watch starts by itself. The
+watcher compares the two accounts (one `GET /api/me` with each) when it starts
+and each time the saved sign-in changes.
+
 ### What the hooks send, and where
 
-The plugin has six hooks (`hooks/hooks.json`). Each runs in the background,
-prints nothing, and exits with no error whatever happens. A hook that sends
-something sends one small request to `POST /api/sessions/<id>/state` on
-PasserJack, for the session that this watcher registered, with the credential
-that registered it:
+The plugin has seven hooks (`hooks/hooks.json`). Six run in the background,
+print nothing, and exit with no error whatever happens. The seventh, for a
+permission prompt, runs in the foreground: it prints only your answer from the
+Agents page, and prints nothing on every other path. A hook that sends
+something sends small requests to `POST /api/sessions/<id>/state` on
+PasserJack (and, for a permission prompt, `/api/sessions/<id>/permissions/...`),
+for the session that this watcher registered, with the credential that
+registered it:
 
 - **After a turn ends.** When nothing happens for a minute (no prompt, no tool
   result, no new turn, no `/clear`) and no background task other than this
   watcher runs, it says that the session waits for you, with the turn's last
   message. The text goes to your own PasserJack account and shows on the
   Agents page. It never sends a push.
-- **A permission prompt.** When a permission prompt is still up after a
-  minute, it says so, with the tool's name only (never what the tool would
-  do). That sends a push: answer the prompt at the terminal. A prompt that
-  you approved, whose tool still runs, sends nothing: the hook sees the
-  tool's process. When Claude Code says that it waits for you while the
-  prompt is up, the hook says so at once.
+- **A permission prompt.** After 2 seconds, the prompt hook sends the tool's
+  name and input, and waits for your answer (see "Answer a permission prompt
+  from PasserJack"). After a minute with no answer it asks for a push. A
+  prompt that you approved, whose tool still runs, sends no push: the hook
+  sees the tool's process. A prompt that the prompt hook does not take (no
+  saved sign-in, or a prompt for a network request of a sandboxed command)
+  gets the push after a minute, with the tool's name only: answer it at the
+  terminal.
 - **A tool finishes after a permission prompt.** It says that the session
   works again.
 - **You type.** Each prompt you type says that the session works, so a
   question you answer at the terminal never reaches your phone.
 
-The hooks keep a small file of their own beside the watcher's file: a counter
-and the permission prompt that is up, never a text, a key or a token.
+The hooks keep a small file of their own beside the watcher's file: a counter,
+the permission prompt that is up, and one entry for each prompt hook that
+waits. It never holds a text, a key or a token.
 
 The watcher tells the hooks which session it holds through a small file in
 `~/.config/passerjack/sessions/` (`%LOCALAPPDATA%\PasserJack\sessions\` on
-Windows): the session id, the PasserJack address and the watcher's process id.
-The file never holds a key or a token. A hook never renews a sign-in: it uses
+Windows): the session id, the PasserJack address, the watcher's process id,
+and a hash that says which credential may get your answers to a prompt. The
+file never holds a key or a token. A hook never renews a sign-in: it uses
 the token the watcher keeps current, and skips one post when that token has
 run out.
 

@@ -1,7 +1,9 @@
 /**
  * Where the plugin finds the programs it starts: the browser opener, the
  * clipboard reader, `git` and `ps`. And the process table that `ps` gives
- * (`processTable`), which the permission waiters read.
+ * (`processTable`, ids and ages only), which the permission waiters read, and
+ * the command lines of the Claude Code process's own children
+ * (`childCommandsOf`), which only the request hook reads, to compare.
  *
  * WHY NOT A BARE NAME. Node starts a program through libuv. On Windows, libuv
  * looks for a bare name in the CURRENT FOLDER first (`search_path` in
@@ -218,5 +220,57 @@ export async function childrenOf(parent, { self = process.pid, env = process.env
   if (!table) return null;
   const mine = ancestorsOf(table, self);
   return table.filter((row) => row.ppid === parent && !mine.has(row.pid));
+}
+
+/**
+ * The output of `ps -ww -o pid=,command=` as a map of process id to its
+ * command line.
+ *
+ * @param {string} text
+ * @returns {Map<number, string>}
+ */
+export function parseCommandTable(text) {
+  const out = new Map();
+  for (const line of String(text).split("\n")) {
+    const m = /^\s*(\d+) (.*)$/.exec(line);
+    if (m) out.set(Number(m[1]), m[2]);
+  }
+  return out;
+}
+
+/**
+ * THE COMMAND LINES OF THE CHILDREN OF `parent` (the Claude Code process), and
+ * of no other process: `childrenOf` first (ids and ages), then ONE
+ * `ps -ww -o pid=,command= -p <those ids>`. `-ww` reads the whole line (a
+ * line cut at the terminal's width never holds the command), and `LC_ALL=C`
+ * keeps the form fixed: macOS prints a line feed as `\012` and a tab as
+ * `\011`, and a byte over 127 as `M-` notation. The request hook reads this
+ * ONLY to compare it with the call it waits for (`shellCallRuns` in
+ * `hook-core.mjs`). No caller logs, posts or stores a command line. Null when
+ * the table cannot be read (Windows, no `ps`, a failure): "unknown", never
+ * "no process". A child that exited between the two reads has `command: null`.
+ *
+ * @param {number} parent
+ * @param {{ self?: number, env?: Record<string, string | undefined>, platform?: string }} [options]
+ * @returns {Promise<{ pid: number, ppid: number, elapsedMs: number, command: string | null }[] | null>}
+ */
+export async function childCommandsOf(parent, { self = process.pid, env = process.env, platform = process.platform } = {}) {
+  const kids = await childrenOf(parent, { self, env, platform });
+  if (!kids || !kids.length) return kids;
+  const ps = findOnPath("ps", { env, platform });
+  if (!ps) return null;
+  return new Promise((resolve) => {
+    execFile(
+      ps,
+      ["-ww", "-o", "pid=,command=", "-p", kids.map((k) => k.pid).join(",")],
+      { timeout: 3000, windowsHide: true, encoding: "utf8", env: { PATH: env.PATH ?? "", LC_ALL: "C" }, maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout) => {
+        // `ps -p` exits 1 when none of the ids is there any more: then every child exited.
+        if (err && !(typeof stdout === "string" && err.code === 1)) return resolve(null);
+        const lines = parseCommandTable(stdout ?? "");
+        resolve(kids.map((k) => ({ ...k, command: lines.get(k.pid) ?? null })));
+      },
+    );
+  });
 }
 

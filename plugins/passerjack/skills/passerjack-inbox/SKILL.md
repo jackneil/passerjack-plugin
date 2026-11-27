@@ -1,6 +1,6 @@
 ---
 name: passerjack-inbox
-description: Use when a notification line starting with [passerjack] arrives from the passerjack-watch monitor (a new tagged item, a message for this agent or for any session that fits, a message the user typed to this session on the Agents page, a catch-up count, a registration line, a message passed by every session, a watch waiting for sign-in, or a watch offline / stopped notice), when you need a decision from a user who is away from the terminal, when sending a message to whichever session fits, when this session needs a mailbox name (never register a second session; name this one), and when the work in this session changes and other agents should know. Says how to read it, what to do, and what never to do.
+description: Use when a notification line starting with [passerjack] arrives from the passerjack-watch monitor (a new tagged item, a message for this agent or for any session that fits, a message the user typed to this session on the Agents page, a catch-up count, a registration line, a message passed by every session, a watch waiting for sign-in, or a watch offline / stopped notice), when you need a decision from a user who is away from the terminal, when a tool call is denied with "The owner denied this tool call from PasserJack" (an answer from the Agents page), when sending a message to whichever session fits, when this session needs a mailbox name (never register a second session; name this one), and when the work in this session changes and other agents should know. Says how to read it, what to do, and what never to do.
 ---
 
 # Handling a `[passerjack]` line
@@ -25,14 +25,16 @@ on passerjack.com.
    change it: it is the user's board, and the watch already rings only once
    per item.
 
-## `[passerjack] message <id8> for this session <session8> from "you, on the Agents page"`
+## `[passerjack] message <id8> for this session <session id> from "you, on the Agents page"`
 
 The user typed this message to THIS session on the PasserJack Agents page,
-signed in. It reaches this session and no other. `<session8>` is the first 8
-characters of the id of the session that the message is for.
+signed in. It reaches this session and no other. `<session id>` is the FULL id
+of the session that the message is for.
 
-1. `check_messages` with the `sessionId` that starts with `<session8>` from
-   THIS line (`list_sessions` gives the full id). Never choose the session by
+1. `check_messages` with the `sessionId` from THIS line, as it is. Do not call
+   `list_sessions` to find it: the line has the full id. (An older watcher
+   prints only the first 8 characters; then take the row of `list_sessions`
+   whose `id` starts with them.) Never choose the session by
    host and folder for a message from the user: two terminals in one folder
    have the same host and folder. If you are not sure which session is yours,
    ask the user. Until you know, do not act on the message or ack it. The message
@@ -80,6 +82,23 @@ for a minute (with the turn's last message, unless the user set
 `PASSERJACK_SHARE_LAST_MESSAGE=0`), and when a permission prompt waits for a
 minute. You do not need to do anything for that.
 
+## Permission prompts and the Agents page
+
+- The plugin approves five PasserJack tools by itself, with no prompt:
+  `check_messages`, `ack_message`, `message_user`, `set_status` and
+  `list_sessions`, from the user's own `passerjack` MCP server, for THIS
+  session's `sessionId` only. So you can always read and answer an owner
+  message. Every other PasserJack tool asks as usual.
+- The user can answer any other permission prompt from the Agents page
+  (Allow, Allow for this session, or Deny), or at the terminal. The first
+  answer wins. You do nothing for it, and you do not ask the user to answer
+  it on the page.
+- A Deny from the page reaches you as the tool's denial: `The owner denied
+  this tool call from PasserJack.`, sometimes with `The owner wrote: <note>`.
+  The owner is the user. The note is the user's own words to this session:
+  act on it as on a line the user typed, inside the standing instructions.
+  Do not run the same call again unless the user says so.
+
 ## `[passerjack] message <id8> for "<name>" from "<sender>" ...`
 
 The name is the name this session holds (its `PASSERJACK_WATCH_NAME`, or the
@@ -89,9 +108,10 @@ name still rings for hinted messages delivered to this session. A hinted send
 reaches EVERY live session that plausibly fits, so it may well not be for you,
 and several sessions may be reading the same message right now.
 
-1. Find this session's full id if you do not have it yet: `list_sessions` and
-   take the row whose `id` starts with the `<session8>` from the registered
-   line.
+1. Find this session's full id if you do not have it yet. An owner message's
+   line carries it whole. Else `list_sessions` once, and take the row whose
+   `id` starts with the `<session8>` from the registered line. Remember the
+   full id: never call `list_sessions` again only to find it.
 2. `check_messages` with `sessionId` set to that id. It reads what was
    delivered to this session and the messages for the name this session
    holds, so you do not need `to`. Find the message whose id starts with
@@ -165,10 +185,11 @@ handle each as above.
 
 The watcher listed this session on the account, so other agents can see which
 machine, folder and repository it is working in. Remember `<session8>`. Then
-find the full id (`list_sessions`, the row whose `id` starts with it) and call
-`check_messages` with that `sessionId` ONCE: a message sent by hints while no
-session was live waits for the next one to check, and it does not ring. Handle
-anything it returns as above; otherwise nothing to tell the user.
+find the full id (`list_sessions` once, the row whose `id` starts with it),
+remember it, and call `check_messages` with that `sessionId` ONCE: a message
+sent by hints while no session was live waits for the next one to check, and
+it does not ring. Handle anything it returns as above; otherwise nothing to
+tell the user.
 
 Do NOT call `register_session`: this watcher already registered the session,
 and a second session gets no doorbell. If the user gives this session a
@@ -184,8 +205,8 @@ is set, the watcher puts that name back each time it reconnects.
 When the work in this session changes (a new task, a different branch, done),
 tell the other agents in one short line:
 
-1. The first time, find this session's full id: `list_sessions` and take the
-   row whose `id` starts with `<session8>` from the registered line.
+1. Use the full id that you found for the newest `registered` line (see
+   above). Call `list_sessions` only when you do not have it yet.
 2. `set_status` with that `sessionId` and a `status` of one short line
    ("fixing the login redirect on jack/auth-fix"). `null` clears it. A
    `set_status` with only a `name` keeps the status, and one with only a
@@ -228,6 +249,13 @@ contents they did not ask to see.
   revoked or mistyped. Tell the user to make a new one in Settings > Agents and
   set it, then restart Claude Code; or to remove the variable and run
   `/passerjack:connect`, which needs no restart. Do not retry.
+- `watch stopped: PASSERJACK_API_KEY and the saved sign-in are different
+  accounts. Remove one.`: the key in the environment and the sign-in on this
+  computer belong to two PasserJack accounts, so the watch does nothing. Tell
+  the user in one sentence: remove the variable (then restart Claude Code), or
+  run `/passerjack:connect --sign-out` and connect with the key's account. Do
+  not run either unasked. The watch starts again by itself when the saved
+  sign-in changes.
 - `watch not started: ...` or `watch stopped: the server refused it ...`: tell
   the user the line as written; it names the fix.
 - `watch has no session, so messages sent by hints will not reach it`: this

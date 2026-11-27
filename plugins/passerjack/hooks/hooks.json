@@ -1,5 +1,5 @@
 {
-  "description": "PasserJack Agents page: after a minute of silence, say that this session's turn ended (with its last message unless PASSERJACK_SHARE_LAST_MESSAGE=0) or that a permission prompt waits; when the person types again or an approved tool finishes, say the session works. Every hook is async, silent and exits 0.",
+  "description": "PasserJack Agents page: after a minute of silence, say that this session's turn ended (with its last message unless PASSERJACK_SHARE_LAST_MESSAGE=0) or that a permission prompt waits; when the person types again or an approved tool finishes or fails, say the session works. The PermissionRequest hook is the one synchronous hook: while the prompt stays live at the terminal, it lets you answer the prompt from the Agents page and prints only that answer. Every other hook is async, silent and exits 0.",
   "hooks": {
     "SessionStart": [
       {
@@ -40,6 +40,20 @@
       {
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/hook.mjs\" tool", "async": true, "timeout": 30 }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/hook.mjs\" tool", "async": true, "timeout": 30 }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/hook.mjs\" request", "timeout": 43200, "onFailure": "continue" }
         ]
       }
     ]

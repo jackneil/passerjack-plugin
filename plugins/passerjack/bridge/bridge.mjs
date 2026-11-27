@@ -31,34 +31,59 @@
  * rotated the pair would leave a spent refresh token in the file, and the
  * next refresh would revoke the sign-in that the Claude Code plugin shares.
  *
+ * THE ONE DOCUMENTED EXCEPTION: A PERMISSION PROMPT THAT WAITS FOR THE OWNER
+ * (design `docs/plans/2026-11-26-remote-permission/design.html`, sections 3
+ * and 8). The hook of a harness whose prompt the owner can answer from
+ * PasserJack (`permissionTier` of `harnesses.mjs`) stays in the foreground
+ * and waits for the answer:
+ *   - a waiting-first harness (`away`: Codex) makes its ONE read, the
+ *     session's "I'm away" switch (the poll route with `wait=0`, 3 s). Off:
+ *     the harness's "no decision" at once, and the old minute of silence.
+ *     On: it posts the request and waits, inside the hook timeout that the
+ *     setup script installs, then prints the harness's own allow or deny;
+ *   - a shim (`always`: opencode) is started by its plugin as a WAITER that
+ *     the program never waits for, and prints `{ reply }` for the plugin.
+ * The wait re-reads the credentials file at each poll and NEVER refreshes a
+ * token (a worker does). Every error is "no decision". The tool's input
+ * stays in this process's memory and goes only into the one request post. A
+ * detached guard worker closes the request (`gone`) when this process is
+ * killed. Remote answers need the saved sign-in (`accountGate`, design D8).
+ *
  * OUTPUT DISCIPLINE. stdout carries the harness's decision and nothing else:
  * nothing at all when there is no decision (or `{}` where the harness parses
- * every stdout as JSON). Every failure is silent and exits 0. No line, here or
- * in a worker, ever prints a credential, a message or the last message,
- * except the decision payload itself, which IS the owner's message.
+ * every stdout as JSON). Every failure is silent and exits 0, except a
+ * permission hook whose harness reads exit 0 as an approval (Junie): that
+ * hook exits 1 on every path that is not the owner's Allow (`hookExitFor`).
+ * No line, here or in a worker, ever prints a credential, a message, the last
+ * message, a tool input or a deny note, except the decision payload itself,
+ * which IS the owner's answer.
  */
 
 import { execFile, spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   bearerOf,
+  credentialsPath,
   HOOK_TOKEN_MARGIN_MS,
   hookBearer,
   loadAuth,
   needsRefresh,
+  readAccount,
   readCredentials,
   renewCredential,
   requestRefresh,
   withLock,
   writeJsonAtomic,
 } from "../bin/credentials.mjs";
-import { startedAfter } from "../bin/hook-core.mjs";
+import { askOwner, denyMessage, POLL_MARGIN_MS, startedAfter } from "../bin/hook-core.mjs";
 import { childrenOf, findOnPath, processTable, safeCwd } from "../bin/programs.mjs";
 import { trace as traceTo, TRACE_SWITCHES } from "../bin/trace.mjs";
 import {
+  ACCOUNTS_DIFFER_LINE,
   BurstWindow,
   SseParser,
   backoffMs,
@@ -75,16 +100,23 @@ import {
 import {
   ALIAS_DEPTH,
   ALIAS_START_SLACK_MS,
+  accountCheckPath,
+  accountGate,
+  accountInputs,
   ancestorAliasPath,
   aliasPath,
   claimRegistration,
   deliveryText,
   idleDelayMs,
   newState,
+  permissionWaitFor,
+  pushAfterMsFor,
   pickOwnerMessages,
   pruneStates,
+  readAccountCheck,
   readState,
   recordDelivered,
+  requestBody,
   shareLastMessage,
   stateBody,
   stateDir,
@@ -92,10 +124,23 @@ import {
   transcriptSize,
   TRANSCRIPT_SETTLE_MS,
   waiterMayPost,
+  writeAccountCheck,
   writeState,
   ensureStateDir,
 } from "./bridge-core.mjs";
-import { harnessFor, normalize, promptDecision, reportsPermissionReply, silentOutput, turnEndDecision } from "./harnesses.mjs";
+import {
+  harnessFor,
+  hookExitFor,
+  normalize,
+  permissionDecision,
+  permissionTier,
+  permissionWaitMs,
+  promptDecision,
+  reportsPermissionReply,
+  SHIM_PERMISSION_WAIT_MS,
+  silentOutput,
+  turnEndDecision,
+} from "./harnesses.mjs";
 
 export const BRIDGE_VERSION = "0.1.0";
 
@@ -112,6 +157,9 @@ export const ACK_RETRY_MS = 2000;
 
 /** How long the foreground waits for the state lock before it gives up (silently). */
 const STATE_LOCK_WAIT_MS = 1500;
+
+/** How often a guard worker checks that the process that waits for the owner is still there. */
+const GUARD_CHECK_MS = 2000;
 
 /** A state lock older than this belongs to a process that died holding it. */
 const STATE_LOCK_STALE_MS = 5000;
@@ -214,10 +262,10 @@ function parseJson(text) {
   }
 }
 
-/** Write `text` (maybe nothing) to stdout, and exit 0 once it is written. */
-function finish(text) {
-  if (!text) process.exit(0);
-  process.stdout.write(text, () => process.exit(0));
+/** Write `text` (maybe nothing) to stdout, and exit with `code` (0 but for Junie's "no decision") once it is written. */
+function finish(text, code = 0) {
+  if (!text) process.exit(code);
+  process.stdout.write(text, () => process.exit(code));
 }
 
 /** Start a detached worker with its stdio closed. Its arguments carry no secret and no text. */
@@ -246,6 +294,145 @@ async function changeState(file, harnessId, fn) {
     writeState(file, state);
     return out;
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* D8: the environment's key and the saved sign-in (`accountGate`).     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The two credentials of the account check: `PASSERJACK_API_KEY`, and the
+ * sign-in saved for `origin` (the file that `loadAuth` does not read when the
+ * key is set). Reads the file; never the network.
+ */
+function credentialFacts(env, origin) {
+  const envKey = (env?.PASSERJACK_API_KEY ?? "").trim() || null;
+  const cred = readCredentials(credentialsPath());
+  return { envKey, saved: cred && cred.origin === origin ? cred : null };
+}
+
+/** The gate from the verdict file only: what a hook in the foreground may use. */
+function gateNow(env, origin) {
+  const facts = credentialFacts(env, origin);
+  return { ...facts, ...accountGate({ ...facts, check: readAccountCheck(accountCheckPath(stateDir())) }) };
+}
+
+/**
+ * The gate, after this WORKER asked `GET /api/me` with each credential when
+ * no verdict covers the pair. ONE COPY of the account read: `readAccount` of
+ * `../bin/credentials.mjs`, the Claude Code watcher's (one `GET /api/me`, no
+ * redirect, a 10 s bound). Only an `ok` answer is an account; a refusal or a
+ * failed read keeps no verdict: the gate stays closed and the next worker
+ * asks again.
+ */
+async function checkedGate(env, origin) {
+  const gate = gateNow(env, origin);
+  if (!gate.needsCheck) return gate;
+  const savedToken = await workerToken({ kind: gate.saved.kind, cred: gate.saved, file: credentialsPath() }).catch(() => null);
+  if (!gate.envKey || !savedToken) return gate;
+  const asBridge = { userAgent: `passerjack-agent-bridge/${BRIDGE_VERSION}` };
+  const [envRead, savedRead] = await Promise.all([readAccount(origin, gate.envKey, asBridge), readAccount(origin, savedToken, asBridge)]);
+  if (envRead.kind !== "ok" || savedRead.kind !== "ok") return gate;
+  try {
+    writeAccountCheck(accountCheckPath(stateDir()), accountInputs(gate.envKey, gate.saved), envRead.id === savedRead.id ? "same" : "mismatch");
+  } catch {
+    return gate;
+  }
+  return gateNow(env, origin);
+}
+
+/* ------------------------------------------------------------------ */
+/* Permission requests: the doors of design 5.1.                        */
+/* ------------------------------------------------------------------ */
+
+const POLL_STATES = new Set(["open", "allowed", "denied", "closed", "unknown"]);
+
+/**
+ * One read of a request row: `GET /api/sessions/<id>/permissions/<key>?wait=`.
+ * `{ kind: "answer", state, away, note }` (`away` true, false, or null when
+ * the server did not send it), or `gone` (404: the session is
+ * not this credential's any more), `refused` (401), `busy` (503 or 429,
+ * with the server's `retry-after`), `unreachable`. Never the input.
+ */
+async function pollRequest(origin, token, sessionId, key, waitS, timeoutMs) {
+  try {
+    const init = { method: "GET", headers: headers(token), redirect: "error", signal: AbortSignal.timeout(timeoutMs) };
+    const res = await fetch(new URL(`/api/sessions/${sessionId}/permissions/${key}?wait=${waitS}`, origin), init);
+    if (res.status === 404) return { kind: "gone" };
+    if (res.status === 401) return { kind: "refused" };
+    // 503 while the replica drains; 429 at the server's poll cap. Both carry `retry-after`.
+    if (res.status === 503 || res.status === 429) {
+      const after = Number(res.headers.get("retry-after"));
+      await res.body?.cancel().catch(() => {});
+      return { kind: "busy", retryMs: Number.isFinite(after) && after > 0 ? after * 1000 : 5000 };
+    }
+    let data = null;
+    try {
+      data = await res.json();
+    } catch {
+      // Not JSON.
+    }
+    if (!res.ok || !data || !POLL_STATES.has(data.state)) return { kind: "unreachable" };
+    // `away` is optional in the design's answer: true, false, or null for not sent.
+    return { kind: "answer", state: data.state, away: typeof data.away === "boolean" ? data.away : null, note: typeof data.note === "string" ? data.note : null };
+  } catch {
+    return { kind: "unreachable" };
+  }
+}
+
+/**
+ * One request of a waiting hook to its session, for `askOwner` of
+ * `../bin/hook-core.mjs` (the ONE copy of the request and wait protocol):
+ * `{ status, answer, retryAfterMs }`, `status` 0 for no answer (no token, the
+ * network, the timeout), `answer` the JSON body or null. Never a redirect.
+ */
+async function sessionRequest(origin, token, method, route, body, timeoutMs) {
+  if (!token) return { status: 0, answer: null, retryAfterMs: null };
+  try {
+    const init = { method, headers: headers(token, body === undefined ? {} : { "content-type": "application/json" }), redirect: "error", signal: AbortSignal.timeout(timeoutMs) };
+    if (body !== undefined) init.body = JSON.stringify(body);
+    const res = await fetch(new URL(route, origin), init);
+    let answer = null;
+    try {
+      answer = await res.json();
+    } catch {
+      // Not JSON, or no body.
+    }
+    const after = Number(res.headers.get("retry-after"));
+    return { status: res.status, answer, retryAfterMs: Number.isFinite(after) && after > 0 ? after * 1000 : null };
+  } catch {
+    return { status: 0, answer: null, retryAfterMs: null };
+  }
+}
+
+/** `POST /api/sessions/<id>/permissions/<key>` with `{ action: "close", by }` or `{ action: "push" }`. Answers the status, or `unreachable`. */
+async function permissionAction(origin, token, sessionId, key, body, timeoutMs = HOOK_READ_TIMEOUT_MS) {
+  if (!token) return "no-token";
+  try {
+    const res = await request(origin, `/api/sessions/${sessionId}/permissions/${key}`, { method: "POST", token, body, timeoutMs });
+    return String(res.status);
+  } catch {
+    return "unreachable";
+  }
+}
+
+/** Is process `pid` still there? A process of another user (EPERM) counts as there. */
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === "EPERM";
+  }
+}
+
+/** Take one request out of the state's map. Answers whether it was there. */
+async function forgetRequest(file, harnessId, key) {
+  return changeState(file, harnessId, (s) => {
+    const had = Object.hasOwn(s.requests, key);
+    delete s.requests[key];
+    return had;
+  }).catch(() => false);
 }
 
 /**
@@ -353,6 +540,8 @@ async function keyByAncestor(dir, harnessId) {
  */
 async function handOn(ctx, file, decide, confirm = false) {
   const { origin, token, harnessId, env } = ctx;
+  // D8: no message is handed on until the account check says the credentials agree.
+  if (!ctx.active) return null;
   const before = readState(file, harnessId);
   if (!before?.sessionId || !token) return null;
   const messages = await ownerMessages(origin, token, before.sessionId);
@@ -398,7 +587,179 @@ async function handOn(ctx, file, decide, confirm = false) {
   return out.text;
 }
 
-/** One hook event. Always resolves to what stdout gets (maybe nothing). */
+/**
+ * THE WAIT FOR THE OWNER'S ANSWER (the documented exception in the header),
+ * driven by `askOwner` of `../bin/hook-core.mjs`: the SAME request post (its
+ * retries, the close of a row that a lost answer may have made), the same
+ * push (tried again on a status that a later try can fix), the same long
+ * poll (its backoff, the close at the deadline, the post again after a long
+ * gap that the server swept) as the Claude Code hook (/dcr wave 1 findings 9
+ * and 61). This function gives it the bridge's own parts:
+ *   - the bearer, read again for EVERY request (a worker may have refreshed
+ *     it); no token, or a 401, asks a `refresh` worker (at most every 30 s)
+ *     and counts as a failure that a later try can fix, as in the hook;
+ *   - D8 as a sign (`account`), read at every pass: the credentials changed;
+ *   - "I'm away" turned off as a sign read off an open answer (`away-off`,
+ *     the `away` tier only, only an explicit `away: false`);
+ *   - every sign closes the row as `gone`: the bridge never knows that the
+ *     prompt was answered at the terminal (opencode's `permission.replied`
+ *     closes that row itself, by its key);
+ *   - an accepted row is a wait: `wait` is set (the next prompt's `working`
+ *     closes a row that a killed hook left) and a detached `guard` worker
+ *     closes it as `gone` if this process is killed. A row posted again
+ *     moves to its new key in the map, with a guard of its own.
+ * Answers the harness's `{ stdout, code }`: the owner's allow or deny (the
+ * entry leaves the map BEFORE the print, so the echo of the shim's own reply
+ * closes nothing), or `undefined` for the old path (a post that did not
+ * land), or the harness's "no decision". Never refreshes a token.
+ */
+async function waitForOwner(ctx, file, sessionId, key, tier, body) {
+  const { origin, harnessId, env } = ctx;
+  const harness = harnessFor(harnessId);
+  const start = Date.now();
+  const none = hookExitFor(harnessId, harness.permissionEvent);
+  let refreshAt = 0;
+  const askRefresh = () => {
+    if (Date.now() < refreshAt) return;
+    spawnWorker("refresh", harnessId, file);
+    refreshAt = Date.now() + 30_000;
+  };
+  const bearer = () => {
+    const token = hookBearer(loadAuth(env, origin));
+    if (!token) askRefresh();
+    return token;
+  };
+  const call = async (method, route, payload, timeoutMs) => {
+    const res = await sessionRequest(origin, bearer(), method, route, payload, timeoutMs);
+    if (res.status === 401) askRefresh();
+    return res;
+  };
+  const out = await askOwner(
+    {
+      now: Date.now,
+      sleep,
+      trace: (...words) => trace(env, harnessId, ctx.event, `perm ${words.join(" ")}`),
+      request: (payload) => call("POST", `/api/sessions/${sessionId}/state`, payload, WORKER_REQUEST_TIMEOUT_MS),
+      poll: (k, waitS) => call("GET", `/api/sessions/${sessionId}/permissions/${k}?wait=${waitS}`, undefined, waitS * 1000 + POLL_MARGIN_MS),
+      action: async (k, payload) => (await call("POST", `/api/sessions/${sessionId}/permissions/${k}`, payload, WORKER_REQUEST_TIMEOUT_MS)).status,
+      signs: () => (gateNow(env, origin).remote ? null : "account"),
+      openSign: (answer) => (tier === "away" && answer.away === false ? "away-off" : null),
+      closeBy: () => "gone",
+      accepted: async (k) => {
+        // The row is on the server. A guard closes it if this process is
+        // killed, and the wait counts as posted, so the next prompt's
+        // `working` closes every row that a killed hook left.
+        await changeState(file, harnessId, (s) => {
+          s.wait = "waiting_permission";
+          s.pending = null;
+        }).catch(() => {});
+        spawnWorker("guard", harnessId, file, [k, String(process.pid)]);
+      },
+      rekey: (oldKey, newKey) =>
+        changeState(file, harnessId, (s) => {
+          const entry = s.requests[oldKey];
+          delete s.requests[oldKey];
+          if (entry) s.requests[newKey] = { ...entry, at: Date.now() };
+        }).catch(() => {}),
+      randomKey: () => crypto.randomUUID(),
+    },
+    { key, body, startedAt: start, deadline: start + permissionWaitFor(env, permissionWaitMs(harnessId)), pushAfterMs: pushAfterMsFor(env) },
+  );
+  if (out.kind === "decision" && harness.deliver === "shim") {
+    // Out of the map BEFORE the print, so the echo of the plugin's own reply
+    // closes nothing; the program's id of the prompt keeps the key in
+    // `taken`, for a reply that opencode refuses (finding 29).
+    await changeState(file, harnessId, (s) => {
+      const ask = s.requests[out.key]?.ask ?? null;
+      delete s.requests[out.key];
+      if (ask) s.taken[ask] = { key: out.key, at: Date.now() };
+    }).catch(() => {});
+  } else {
+    await forgetRequest(file, harnessId, out.key);
+  }
+  if (out.kind === "not-accepted") {
+    trace(env, harnessId, ctx.event, `perm-post-${out.status} input=${body.inputTooLong ? "too-long" : body.toolInput ? "yes" : "no"}`);
+    if (out.status === 404) {
+      // The server no longer knows the session: register again.
+      const ask = await changeState(file, harnessId, (s) => {
+        s.sessionId = null;
+        s.registerAt = 0;
+        return claimRegistration(s);
+      }).catch(() => false);
+      if (ask) spawnWorker("register", harnessId, file);
+    }
+    // The server's brake (`accepted: false` in a 2xx): give up at once and
+    // post nothing more (design 5.1). Any other refusal: the old path.
+    const braked = out.status >= 200 && out.status < 300 && out.answer && typeof out.answer === "object" && out.answer.accepted === false;
+    return braked ? none : undefined;
+  }
+  if (out.kind === "ended") {
+    trace(env, harnessId, ctx.event, `decision-none ${out.why}`);
+    return none;
+  }
+  const behavior = out.answer.state === "allowed" ? "allow" : "deny";
+  trace(env, harnessId, ctx.event, `decision-${behavior} note=${out.answer.note ? "yes" : "no"}`);
+  return permissionDecision(harnessId, behavior, behavior === "deny" ? denyMessage(typeof out.answer.note === "string" ? out.answer.note : null) : null) ?? none;
+}
+
+/**
+ * A permission prompt that may wait for the owner's answer from PasserJack.
+ * Answers `undefined` for the old path (the minute of silence, no answer
+ * from PasserJack): a harness that never answers, the old shim call, no
+ * remote answers for these credentials (D8), a tool name the server cannot
+ * take, no session yet, the owner not away (`away` tier), or a request post
+ * that did not land. Else the final `{ stdout, code }` (`waitForOwner`).
+ */
+async function remotePermission(ctx, harness, file, n, gate, cwd) {
+  const { origin, harnessId, env } = ctx;
+  const tier = permissionTier(harnessId);
+  if (tier === "never" || (harness.deliver === "shim" && !n.answer)) return undefined;
+  if (n.sandboxBypass) {
+    // Copilot: an allow from a hook does not skip the prompt to leave the sandbox.
+    trace(env, harnessId, n.event, "perm-sandbox");
+    return undefined;
+  }
+  if (!gate.remote) {
+    trace(env, harnessId, n.event, `perm-no-remote ${gate.needsCheck ? "unchecked" : "env-key"}`);
+    return undefined;
+  }
+  // A tool name the server cannot take: the page could not say which tool
+  // gets the input, so the bridge takes no part (/dcr wave 1 finding 68).
+  if (!n.tool) {
+    trace(env, harnessId, n.event, "perm-no-tool");
+    return undefined;
+  }
+  const sessionId = readState(file, harnessId)?.sessionId;
+  if (!sessionId || !ctx.token) {
+    trace(env, harnessId, n.event, `perm-not-ready session=${sessionId ? "yes" : "no"} token=${ctx.token ? "yes" : "no"}`);
+    return undefined;
+  }
+  const key = crypto.randomUUID();
+  if (tier === "away") {
+    // THE ONE READ: the session's "I'm away" switch, on the poll route with wait=0 (a key the server does not know yet).
+    const read = await pollRequest(origin, ctx.token, sessionId, key, 0, HOOK_READ_TIMEOUT_MS);
+    if (read.kind !== "answer" || read.away !== true) {
+      trace(env, harnessId, n.event, `perm-away-off read=${read.kind}`);
+      return undefined;
+    }
+    trace(env, harnessId, n.event, "perm-away-on");
+  }
+  if (harness.deliver === "shim") exitWithParent();
+  await changeState(file, harnessId, (s) => {
+    s.cwd ??= cwd;
+    s.counter += 1;
+    s.requests[key] = { ask: n.requestId, tool: n.tool, at: Date.now(), pid: process.pid };
+  });
+  // The one request that carries the input, from this process's memory.
+  trace(env, harnessId, n.event, `perm-post input=${n.inputTooLong ? "too-long" : n.input ? "yes" : "no"}`);
+  return waitForOwner(ctx, file, sessionId, key, tier, requestBody({ requestKey: key, tool: n.tool, input: n.input, inputTooLong: n.inputTooLong }));
+}
+
+/**
+ * One hook event. Resolves to what stdout gets: a string (maybe nothing)
+ * with the hook's "no decision" exit code (`hookExitFor`), or a permission
+ * decision `{ stdout, code }`.
+ */
 async function runHook(harnessId, eventArg, env) {
   const harness = harnessFor(harnessId);
   if (!harness) return "";
@@ -413,13 +774,20 @@ async function runHook(harnessId, eventArg, env) {
     env,
     harnessId,
     n.event,
-    `normalized from=${String(eventArg).replace(/[^A-Za-z0-9_.-]/g, "?")} key=${n.sessionKey ? "yes" : "no"} cwd=${n.cwd ? "yes" : "no"} last=${n.lastMessage ? "yes" : "no"} tool=${n.tool ?? "none"} stopActive=${n.stopActive}`,
+    `normalized from=${String(eventArg).replace(/[^A-Za-z0-9_.-]/g, "?")} key=${n.sessionKey ? "yes" : "no"} cwd=${n.cwd ? "yes" : "no"} last=${n.lastMessage ? "yes" : "no"} tool=${n.tool ?? "none"} stopActive=${n.stopActive} input=${n.inputTooLong ? "too-long" : n.input ? "yes" : "no"} ask=${n.requestId ? "yes" : "no"}`,
   );
   const origin = resolveOrigin(env);
   if (!origin.ok) return silent;
   const auth = loadAuth(env, origin.origin);
   if (!auth) {
     trace(env, harnessId, n.event, "no-sign-in");
+    return silent;
+  }
+  // D8: two credentials of different accounts: do nothing at all. No verdict
+  // yet: no read and no answer here, and a worker asks.
+  const gate = gateNow(env, origin.origin);
+  if (gate.mismatch) {
+    trace(env, harnessId, n.event, "account-mismatch");
     return silent;
   }
   const dir = stateDir();
@@ -432,7 +800,11 @@ async function runHook(harnessId, eventArg, env) {
   const cwd = n.cwd ?? process.cwd();
   const token = hookBearer(auth);
   if (!token) spawnWorker("refresh", harnessId, file);
-  const ctx = { origin: origin.origin, token, harnessId, env, event: n.event };
+  if (gate.needsCheck) {
+    spawnWorker("check", harnessId, file);
+    trace(env, harnessId, n.event, "account-unchecked");
+  }
+  const ctx = { origin: origin.origin, token, harnessId, env, event: n.event, active: gate.active };
 
   if (n.event === "last_text") {
     await changeState(file, harnessId, (s) => {
@@ -484,15 +856,52 @@ async function runHook(harnessId, eventArg, env) {
   }
 
   if (n.event === "resolved") {
-    const had = await changeState(file, harnessId, (s) => {
+    // A prompt was answered (opencode's `permission.replied`, with the
+    // program's own id of it). A request that still waits for the owner
+    // closes ONE row by its key: `terminal` for the person at the terminal,
+    // `session` for a prompt that opencode itself rejected after the owner's
+    // Deny on another one (/dcr wave 1 finding 38: until then the page said
+    // "answered at the terminal" for a rejection the owner caused). `working`
+    // closes every open row of the session, so it is posted only when no
+    // request waits. A request that the waiter already took (the echo of the
+    // plugin's own reply) is out of the map, and nothing closes twice.
+    const out = await changeState(file, harnessId, (s) => {
       s.counter += 1;
       s.pending = null;
-      const open = s.wait;
-      s.wait = null;
-      return open;
+      const close = [];
+      // The echo of the plugin's own reply: the answer was handed on.
+      if (n.requestId) delete s.taken[n.requestId];
+      if (n.requestId) {
+        for (const [requestKey, r] of Object.entries(s.requests)) {
+          if (r.ask !== n.requestId) continue;
+          close.push(requestKey);
+          delete s.requests[requestKey];
+        }
+      }
+      const open = Object.keys(s.requests).length === 0 ? s.wait : null;
+      if (open) s.wait = null;
+      return { open, close };
     });
-    if (had) spawnWorker("working", harnessId, file);
-    trace(env, harnessId, n.event, had ? "working" : "resolved");
+    const by = n.closer === "session" ? "session" : "terminal";
+    for (const requestKey of out.close) spawnWorker("close", harnessId, file, [requestKey, by]);
+    if (out.open) spawnWorker("working", harnessId, file);
+    trace(env, harnessId, n.event, `${out.open ? "working" : "resolved"} closed-${out.close.length} by-${by}`);
+    return silent;
+  }
+
+  if (n.event === "reply_refused") {
+    // The shim took the owner's answer (the row closed as `owner`), and
+    // opencode refused its out-of-band reply, or the reply threw (/dcr wave 1
+    // finding 29): the prompt waits at the terminal, so the page must not say
+    // "Allowed here". The row closes as `terminal` by the request's own
+    // credential and key, which the server takes as a re-resolve of a taken row.
+    const key = await changeState(file, harnessId, (s) => {
+      const taken = n.requestId ? s.taken[n.requestId] : null;
+      if (n.requestId) delete s.taken[n.requestId];
+      return taken?.key ?? null;
+    }).catch(() => null);
+    if (key) spawnWorker("close", harnessId, file, [key, "terminal"]);
+    trace(env, harnessId, n.event, `perm-reply-refused taken=${key ? "yes" : "no"}`);
     return silent;
   }
 
@@ -518,6 +927,14 @@ async function runHook(harnessId, eventArg, env) {
   }
 
   if (n.event === "permission" || n.event === "question") {
+    // The event whose output is the decision (Codex's PermissionRequest, the
+    // opencode waiter), not a notification that a prompt is up.
+    if (n.event === "permission" && eventArg === harness.permissionEvent) {
+      const answered = await remotePermission(ctx, harness, file, n, gate, cwd);
+      if (answered !== undefined) return answered;
+      // Copilot's permissionRequest has no old path: its notification hook posts the prompt.
+      if (harness.permissionLegacy === false) return silent;
+    }
     const counter = await changeState(file, harnessId, (s) => {
       s.cwd ??= cwd;
       s.counter += 1;
@@ -657,8 +1074,52 @@ async function runWorker(job, harnessId, file, extra, env) {
   if (!auth) return;
   const ctx = { origin: origin.origin, auth, harnessId, env };
 
+  // D8 first, in every worker: with two credentials of different accounts (or
+  // no verdict yet that they agree), nothing registers, posts or refreshes.
+  const gate = await checkedGate(env, origin.origin);
+  if (!gate.active) {
+    trace(env, harnessId, "worker", `${String(job).slice(0, 20)}-account-${gate.mismatch ? "mismatch" : "unchecked"}`);
+    return;
+  }
+  if (job === "check") return;
+
   if (job === "refresh") {
     await workerToken(auth);
+    return;
+  }
+  if (job === "close") {
+    // One request row closes: `terminal` (`permission.replied`, or a reply
+    // that opencode refused), `session` (opencode rejected it itself) or `gone`.
+    const [key, by] = extra;
+    if (!UUID_RE.test(key ?? "") || (by !== "terminal" && by !== "gone" && by !== "session")) return;
+    const sessionId = readState(file, harnessId)?.sessionId;
+    if (!sessionId) return;
+    const out = await permissionAction(ctx.origin, await workerToken(auth), sessionId, key, { action: "close", by }, WORKER_REQUEST_TIMEOUT_MS);
+    trace(env, harnessId, "worker", `close-${by}-${out}`);
+    return;
+  }
+  if (job === "guard") {
+    // The waiting process of one request: when it is gone with its request
+    // still in the map (killed at the harness's timeout, or with its program),
+    // the row closes as `gone`, so the page stops offering an answer that
+    // nothing would take. Bounded by the longest wait.
+    const [key, pidText] = extra;
+    const pid = Number(pidText);
+    if (!UUID_RE.test(key ?? "") || !Number.isSafeInteger(pid) || pid <= 1) return;
+    const until = Date.now() + SHIM_PERMISSION_WAIT_MS + 60_000;
+    while (Date.now() < until) {
+      await sleep(GUARD_CHECK_MS);
+      const entry = readState(file, harnessId)?.requests?.[key];
+      if (!entry || entry.pid !== pid) return;
+      if (alive(pid)) continue;
+      if (!(await forgetRequest(file, harnessId, key))) return;
+      const sessionId = readState(file, harnessId)?.sessionId;
+      const out = sessionId
+        ? await permissionAction(ctx.origin, await workerToken(auth), sessionId, key, { action: "close", by: "gone" }, WORKER_REQUEST_TIMEOUT_MS)
+        : "no-session";
+      trace(env, harnessId, "worker", `guard-closed-${out}`);
+      return;
+    }
     return;
   }
   if (job === "register") {
@@ -718,6 +1179,7 @@ async function runWorker(job, harnessId, file, extra, env) {
     if (first.pending.transcript) {
       await sleep(Math.min(TRANSCRIPT_SETTLE_MS, Math.max(0, due - Date.now())));
       baseline = transcriptSize(first.pending.transcript);
+      trace(env, harnessId, "worker", `wait-baseline ${baseline === null ? "none" : "taken"}`);
     }
     await sleep(Math.max(0, due - Date.now()));
     if (baseline !== null) {
@@ -864,6 +1326,19 @@ async function runWatch(harnessId, args, env) {
   let lastEventId = "";
   let attempt = 0;
   for (;;) {
+    // D8: two credentials of different accounts stop the watch with one line
+    // (a Grok Build monitor shows its lines to the agent; the opencode
+    // plugin's doorbell would read any line as a ring, so it gets none).
+    const gate = await checkedGate(env, origin.origin);
+    if (gate.mismatch) {
+      if (harnessFor(harnessId).aliasByAncestor) print(ACCOUNTS_DIFFER_LINE);
+      return;
+    }
+    if (!gate.active) {
+      // No verdict yet (the server did not answer): ask again later, not at once.
+      await sleep(backoffMs(attempt++));
+      continue;
+    }
     const auth = loadAuth(env, origin.origin);
     const file = auth ? await findWatchedState(harnessId, sessionKey, process.cwd()) : null;
     const sessionId = file ? readState(file, harnessId)?.sessionId : null;
@@ -979,14 +1454,19 @@ export async function main(argv = process.argv.slice(2), baseEnv = process.env) 
     return;
   }
   const [eventArg] = rest;
-  let out = silentOutput(first);
+  // The "no decision" answer comes from the arguments alone, BEFORE stdin is
+  // read: every path that is not a decision ends with it (Junie's permission
+  // hook exits 1, because an exit 0 approves).
+  const fallback = hookExitFor(first, eventArg);
+  let out = fallback;
   try {
-    out = await runHook(first, eventArg, env);
+    const answer = await runHook(first, eventArg, env);
+    out = typeof answer === "string" ? { stdout: answer, code: fallback.code } : (answer ?? fallback);
   } catch (err) {
     // Silent on every failure: the harness goes on as if there were no hook.
     trace(env, String(first), String(eventArg), `hook-threw ${errorWord(err)}`);
   }
-  finish(out);
+  finish(out.stdout, out.code);
 }
 
 const invokedDirectly = (() => {
@@ -998,5 +1478,7 @@ const invokedDirectly = (() => {
 })();
 
 if (invokedDirectly) {
-  main().catch(() => process.exit(0));
+  // A throw that escaped `main` still ends with the hook's own "no decision" code.
+  const fallback = hookExitFor(process.argv[2], process.argv[3]).code;
+  main().catch(() => process.exit(fallback));
 }

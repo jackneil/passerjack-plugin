@@ -15,7 +15,23 @@
  *   - `delivered`: the ids of the owner messages this session was given, so
  *     no message is given twice (an ack needs `write`, and the shared sign-in
  *     is `read`: this ledger, not the ack, is what makes delivery at most once);
- *   - `pending` and `wait`: the wait a waiter will post, and the one it posted.
+ *   - `pending` and `wait`: the wait a waiter will post, and the one it posted;
+ *   - `requests`: the permission prompts that wait for the owner's answer
+ *     from PasserJack, KEYED BY THE REQUEST KEY (a uuid the bridge makes per
+ *     prompt): the program's own id of the prompt (opencode's), the tool's
+ *     name, when it was asked, and the process that waits. An entry leaves
+ *     the map when its prompt closes by any path, the owner's answer
+ *     included. NEVER the tool's input: the waiting
+ *     process keeps the input in its memory and sends it in the one request
+ *     post, so a killed process leaves no input on the disk;
+ *   - `taken` (a shim only): the requests whose owner's answer the waiter
+ *     took and printed, BY THE PROGRAM'S OWN ID of the prompt (opencode's):
+ *     the request key and when. The plugin hands the answer on out of band,
+ *     and when opencode refuses it (`reply_refused`) the bridge closes that
+ *     key's row as answered at the terminal (/dcr wave 1 finding 29). The echo
+ *     of the plugin's own reply (`permission.replied`) removes the entry. It
+ *     is a map of its own, so that echo never reads as a prompt that still
+ *     waits (the `requests` map).
  * NEVER a credential, a key or a token. The last message waits here for its
  * minute (the user's own text, on the user's own machine, 0600), and is
  * removed when it is posted or replaced.
@@ -31,7 +47,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { writeJsonAtomic } from "../bin/credentials.mjs";
+import { signInIdentity, writeJsonAtomic } from "../bin/credentials.mjs";
+import { PERMISSION_PUSH_AFTER_MS } from "../bin/hook-core.mjs";
 
 /** The minute of silence before a finished turn or an open prompt is posted (design C8). */
 export const IDLE_DELAY_MS = 60_000;
@@ -100,10 +117,53 @@ export function newState(harness, now = Date.now()) {
     turnDeliveries: 0,
     wait: null,
     pending: null,
+    requests: {},
+    taken: {},
     lastText: null,
     registerAt: 0,
     updatedAt: now,
   };
+}
+
+/**
+ * A request entry older than this is dropped when the state is read: it is
+ * longer than any wait (`SHIM_PERMISSION_WAIT_MS` of `harnesses.mjs`, twelve
+ * hours), so its process is gone, and the server's sweep has closed its row.
+ */
+export const MAX_REQUEST_AGE_MS = 13 * 60 * 60_000;
+
+/** A request id of the program (opencode's), as the adapter keeps it: one printable line of at most 200 characters. */
+const ASK_RE = /^[\x21-\x7e]{1,200}$/;
+
+/** The `requests` map of a state file, repaired entry by entry. */
+function parseRequests(value, now) {
+  const out = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return out;
+  for (const [key, r] of Object.entries(value)) {
+    if (!isUuid(key) || !r || typeof r !== "object" || !Number.isFinite(r.at) || now - r.at > MAX_REQUEST_AGE_MS) continue;
+    out[key.toLowerCase()] = {
+      ask: typeof r.ask === "string" && ASK_RE.test(r.ask) ? r.ask : null,
+      tool: typeof r.tool === "string" ? r.tool : null,
+      at: r.at,
+      pid: Number.isSafeInteger(r.pid) && r.pid > 1 ? r.pid : null,
+    };
+  }
+  return out;
+}
+
+/**
+ * The `taken` map of a state file, repaired entry by entry: the program's id
+ * of the prompt to `{ key, at }`. An entry older than `MAX_REQUEST_AGE_MS` is
+ * dropped: the plugin hands an answer on within seconds of the print.
+ */
+function parseTaken(value, now) {
+  const out = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return out;
+  for (const [ask, t] of Object.entries(value)) {
+    if (!ASK_RE.test(ask) || !t || typeof t !== "object" || !isUuid(t.key) || !Number.isFinite(t.at) || now - t.at > MAX_REQUEST_AGE_MS) continue;
+    out[ask] = { key: t.key.toLowerCase(), at: t.at };
+  }
+  return out;
 }
 
 /** How long a waiter lets the transcript settle before it takes its size as the baseline. */
@@ -168,7 +228,7 @@ export function claimRegistration(state, now = Date.now()) {
 const isUuid = (value) => typeof value === "string" && UUID_RE.test(value);
 
 /** A parsed state file, repaired field by field, or null when it is not one. */
-export function parseState(value, harness) {
+export function parseState(value, harness, now = Date.now()) {
   if (!value || typeof value !== "object" || Array.isArray(value) || value.v !== 1 || value.harness !== harness) return null;
   if (!isUuid(value.clientId)) return null;
   const pending =
@@ -194,6 +254,8 @@ export function parseState(value, harness) {
     turnDeliveries: Number.isSafeInteger(value.turnDeliveries) && value.turnDeliveries >= 0 ? value.turnDeliveries : 0,
     wait: value.wait === "idle" || value.wait === "waiting_permission" ? value.wait : null,
     pending,
+    requests: parseRequests(value.requests, now),
+    taken: parseTaken(value.taken, now),
     lastText: typeof value.lastText === "string" ? value.lastText : null,
     registerAt: Number.isFinite(value.registerAt) ? value.registerAt : 0,
     updatedAt: Number.isFinite(value.updatedAt) ? value.updatedAt : 0,
@@ -320,4 +382,127 @@ export function stateBody(pending) {
     return pending.tool ? { state: "waiting_permission", tool: pending.tool } : { state: "waiting_permission" };
   }
   return pending.lastMessage ? { state: "idle", lastMessage: pending.lastMessage } : { state: "idle" };
+}
+
+/**
+ * THE REQUEST POST (design 5.1 of
+ * `docs/plans/2026-11-26-remote-permission/design.html`): the body of `POST
+ * /api/sessions/<id>/state` for a prompt that waits for the owner's answer.
+ * The server makes one permission row and its side row, idempotent by
+ * `requestKey`, and pushes nothing at the insert. `toolInput` is the EXACT
+ * input, or absent with `inputTooLong: true` (never a cut input), or absent
+ * when the harness sent none. The bridge's harnesses send no session grant.
+ */
+export function requestBody({ requestKey, tool, input, inputTooLong }) {
+  const body = { state: "waiting_permission", requestKey };
+  if (tool) body.tool = tool;
+  if (inputTooLong) body.inputTooLong = true;
+  else if (typeof input === "string" && input.length > 0) body.toolInput = input;
+  return body;
+}
+
+/*
+ * A prompt with no sign of an answer for `PERMISSION_PUSH_AFTER_MS` (the
+ * leaf's number, ONE copy in `../bin/hook-core.mjs`, imported above) asks the
+ * server for one push.
+ */
+
+/** `PASSERJACK_BRIDGE_PUSH_MS` may bring the push nearer, only from 1 s up to the minute (a test seam). */
+export function pushAfterMsFor(env) {
+  const raw = (env?.PASSERJACK_BRIDGE_PUSH_MS ?? "").trim();
+  if (!/^\d+$/.test(raw)) return PERMISSION_PUSH_AFTER_MS;
+  const ms = Number(raw);
+  return ms >= 1000 && ms <= PERMISSION_PUSH_AFTER_MS ? ms : PERMISSION_PUSH_AFTER_MS;
+}
+
+/*
+ * The long poll's wait, in seconds (the server waits up to this long for a
+ * change of the row), is `POLL_WAIT_S` of `../bin/hook-core.mjs`, the one copy
+ * that the Claude Code hook polls with too.
+ */
+
+/** `PASSERJACK_BRIDGE_WAIT_MS` may shorten a permission wait, only inside these bounds (a test seam). */
+export const MIN_PERMISSION_WAIT_MS = 1000;
+
+/** The wait of a permission hook: the harness's own `max`, or `PASSERJACK_BRIDGE_WAIT_MS` when it is a whole number from 1 s up to `max`. */
+export function permissionWaitFor(env, max) {
+  const raw = (env?.PASSERJACK_BRIDGE_WAIT_MS ?? "").trim();
+  if (!/^\d+$/.test(raw)) return max;
+  const ms = Number(raw);
+  return ms >= MIN_PERMISSION_WAIT_MS && ms <= max ? ms : max;
+}
+
+/* ------------------------------------------------------------------ */
+/* D8: an environment key and the saved sign-in of different accounts. */
+/* ------------------------------------------------------------------ */
+
+/**
+ * THE ACCOUNT CHECK (design D8 of the remote permission design; #787i). When
+ * `PASSERJACK_API_KEY` is set AND a sign-in is saved for the same origin,
+ * the two can belong to DIFFERENT accounts. Then the bridge does NOTHING: no
+ * registration, no post, no message, no answer. A WORKER (it has the
+ * network) asks `GET /api/me` with each and keeps the verdict in this file
+ * in the state folder; a hook in the foreground reads only this file. The
+ * file holds a hash of the two sign-ins' identities (`signInIdentity`, never a
+ * token, never a key, never the bare hash of a key) and the verdict; a new
+ * key or a new sign-in changes the hash, so an old verdict never counts.
+ *
+ * REMOTE ANSWERS NEED THE SAVED SIGN-IN: a prompt waits for the owner's
+ * answer only when the bearer is the saved sign-in, or an environment key of
+ * the same account. An environment key alone works for messages and status,
+ * and gets no answers: a repository that sets the key cannot answer a prompt
+ * on this computer from another account.
+ */
+// Not `.json`: the readers of the session state files (the watch's folder
+// scan, the tests) take every `.json` in the folder for a session.
+export const ACCOUNT_CHECK_FILE = "account-check.verdict";
+
+/** The verdict file in the state folder. */
+export function accountCheckPath(dir) {
+  return path.join(dir, ACCOUNT_CHECK_FILE);
+}
+
+/** The hash that names one pair of sign-ins, or null when there are not two. */
+export function accountInputs(envKey, saved) {
+  if (!envKey || !saved) return null;
+  return crypto
+    .createHash("sha256")
+    .update(`passerjack-account-check\0${signInIdentity({ kind: "env", key: envKey })}\0${signInIdentity(saved)}`)
+    .digest("hex");
+}
+
+/** The verdict in `file`: `{ inputs, verdict }`, or null. Never throws. */
+export function readAccountCheck(file) {
+  try {
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (value?.v !== 1 || typeof value.inputs !== "string" || (value.verdict !== "same" && value.verdict !== "mismatch")) return null;
+    return { inputs: value.inputs, verdict: value.verdict };
+  } catch {
+    return null;
+  }
+}
+
+/** Keep a verdict. Throws on failure. */
+export function writeAccountCheck(file, inputs, verdict, now = Date.now()) {
+  writeJsonAtomic(file, { v: 1, inputs, verdict, at: now });
+}
+
+/**
+ * What the bridge may do with these credentials. `active`: it may register,
+ * post and hand messages on. `remote`: a prompt may wait for the owner's
+ * answer. `needsCheck`: there is no verdict yet for this pair, so a worker
+ * must ask; until then the bridge does nothing (fail closed). `mismatch`: the
+ * verdict is that the two are different accounts.
+ *
+ * @param {{ envKey: string | null, saved: object | null, check: { inputs: string, verdict: string } | null }} facts
+ */
+export function accountGate({ envKey, saved, check }) {
+  if (!envKey) return { active: Boolean(saved), remote: Boolean(saved), needsCheck: false, mismatch: false };
+  if (!saved) return { active: true, remote: false, needsCheck: false, mismatch: false };
+  const inputs = accountInputs(envKey, saved);
+  if (check && check.inputs === inputs) {
+    const same = check.verdict === "same";
+    return { active: same, remote: same, needsCheck: false, mismatch: !same };
+  }
+  return { active: false, remote: false, needsCheck: true, mismatch: false };
 }

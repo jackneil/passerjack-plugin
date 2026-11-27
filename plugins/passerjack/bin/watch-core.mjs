@@ -408,6 +408,7 @@ function shortId(value) {
   return (typeof value === "string" ? value : "").replace(/[^0-9A-Za-z-]/g, "").slice(0, 8) || "unknown";
 }
 
+
 function count(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
@@ -443,13 +444,14 @@ export const OWNER_TARGET_NAME = "@session";
  * session. The frame's `targetSessionId` (a newer server sends it) names the
  * session; when it is this watcher's own, or when the frame has none (an
  * older server, which rings an owner message on its target session's watch
- * only), it is THIS session.
+ * only), it is THIS session, and the line carries its FULL id (0.4.0), which
+ * `check_messages` takes as it is: no `list_sessions` call to find it.
  */
 function ownerAudience(target, ownSessionId) {
   const own = typeof ownSessionId === "string" && UUID_RE.test(ownSessionId) ? ownSessionId.toLowerCase() : null;
   const named = typeof target === "string" && UUID_RE.test(target) ? target.toLowerCase() : null;
   if (named && named !== own) return `for session ${shortId(named)}`;
-  if (own) return `for this session ${shortId(own)}`;
+  if (own) return `for this session ${own}`;
   return `for ${quoted(OWNER_TARGET_NAME)}`;
 }
 
@@ -670,6 +672,15 @@ export function reprintsRegistered(reason) {
 
 /** The line a 401 prints before the watcher exits, for a key from `PASSERJACK_API_KEY`. */
 export const KEY_REFUSED_LINE = `${LINE_PREFIX} watch stopped: the API key was refused`;
+
+/**
+ * D8 (#787i, design `docs/plans/2026-11-26-remote-permission/design.html`):
+ * `PASSERJACK_API_KEY` and the saved sign-in belong to DIFFERENT accounts.
+ * The watcher registers nothing and writes no link, so every hook does
+ * nothing, and it prints this ONE line. It starts by itself when the saved
+ * sign-in changes to the key's account, or goes.
+ */
+export const ACCOUNTS_DIFFER_LINE = `${LINE_PREFIX} watch stopped: PASSERJACK_API_KEY and the saved sign-in are different accounts. Remove one.`;
 
 /**
  * The ONE line printed when there is no key in the environment and no usable

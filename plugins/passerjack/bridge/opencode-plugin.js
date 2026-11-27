@@ -15,8 +15,29 @@
  *   - `session.idle` (the turn ended): the bridge posts the minute of silence
  *     with the last message, or hands on an owner message, which this file
  *     sends as a prompt, so the session works on it at once.
- *   - a permission is asked: the bridge posts `waiting_permission` after a
+ *   - a permission is asked (`permission.asked`, V1 on opencode only): this
+ *     file starts ONE WAITER per prompt, a bridge child that it never waits
+ *     for, with the prompt's small JSON on its stdin (the tool's input
+ *     included, never in argv). The waiter posts the request so the owner
+ *     can answer it on the Agents page, and prints `{ "reply": "once" }` or
+ *     `{ "reply": "reject" }` when the owner does; this file then answers
+ *     opencode out of band. NEVER `always`. The prompt stays answerable at
+ *     the terminal the whole time, and the terminal answer wins. A `reject`
+ *     in opencode also rejects every other open prompt of that session.
+ *     When the bridge gives no remote answers (no saved sign-in, Kilo Code
+ *     until a live walk, V2), the bridge posts `waiting_permission` after a
  *     minute, unless `permission.replied` (the user answered) came first.
+ *   - `permission.replied`: the bridge closes that prompt's request as
+ *     answered at the terminal (nothing for the echo of this file's own
+ *     reply), then this file stops the prompt's waiter. A `reject` that
+ *     opencode made itself, for another prompt of the session, right after
+ *     this file sent the owner's `reject` (`CASCADE_WINDOW_MS`), goes to the
+ *     bridge with `by: "session"`: that row closes as closed by the session,
+ *     never as answered at the terminal.
+ *   - an out-of-band reply that opencode refuses, or that throws: this file
+ *     tells the bridge (`reply_refused`, with opencode's id of the prompt),
+ *     so the row closes as answered at the terminal and the page stops
+ *     saying the owner's answer decided it.
  *   - WHILE A SESSION IS IDLE, this file holds the session's doorbell (the
  *     bridge's `watch` mode, one child per idle session). A line from it is a
  *     message for the session; the bridge hands it on (`wake`) and this file
@@ -40,14 +61,37 @@ const BRIDGE_TIMEOUT_MS = 10_000;
 const MAX_OUTPUT_BYTES = 256 * 1024;
 
 /**
+ * After this file sends the owner's `reject`, opencode rejects every other
+ * open prompt of that session in the same step and sends a
+ * `permission.replied` for each (`permission/index.ts` of v1.18.14). A
+ * `reject` for another prompt of the session that comes while the reply is
+ * on its way, or this long after it, is that cascade.
+ */
+const CASCADE_WINDOW_MS = 2000;
+
+/**
  * How long a V1 prompt may run before it counts as taken. `session.prompt`
  * answers only when the whole turn has run; a refusal (an unknown session, a
  * bad model, a busy session) answers at once.
  */
 const PROMPT_ACCEPT_MS = 2000;
 
+/**
+ * The longest a prompt's waiter may run: the bridge's own end of a shim's
+ * wait (`SHIM_PERMISSION_WAIT_MS`, twelve hours) and a minute more. The
+ * bridge stops first; this is the net for a waiter that hangs.
+ */
+const WAITER_MAX_MS = 12 * 60 * 60_000 + 60_000;
+
 const ready = () => !NODE.startsWith("__PASSERJACK") && !BRIDGE.startsWith("__PASSERJACK");
 const harness = () => (HARNESS === "kilo" ? "kilo" : "opencode");
+
+/**
+ * Answers from PasserJack on opencode only. Kilo Code stays on the old path
+ * until a live walk proves its reply: it ignores a reply that is not
+ * interactive for some requests.
+ */
+const answersHere = () => harness() === "opencode";
 
 /** Run one bridge event. Resolves `{ text, ids }` when it wants text delivered, or null. */
 function callBridge(event, payload) {
@@ -128,6 +172,90 @@ function doorbells(onRing) {
   };
 }
 
+/**
+ * The waiters of open permission prompts: one bridge child each, by
+ * opencode's own request id. A waiter's stdout is one JSON line,
+ * `{ "reply": "once" | "reject", "message"? }`, or nothing (the prompt closed
+ * another way). This file never waits for a waiter in an event handler.
+ */
+function waiters() {
+  const children = new Map();
+  return {
+    /** Start the waiter of `requestID` once; `onAnswer` gets `{ reply, message }` or nothing. */
+    start(requestID, payload, onAnswer) {
+      if (!ready() || children.has(requestID)) return;
+      let child;
+      try {
+        child = spawn(NODE, [BRIDGE, harness(), "permission"], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
+      } catch {
+        return;
+      }
+      children.set(requestID, child);
+      const chunks = [];
+      let size = 0;
+      const timer = setTimeout(() => child.kill(), WAITER_MAX_MS);
+      timer.unref?.();
+      child.stdout.on("data", (chunk) => {
+        size += chunk.length;
+        if (size <= MAX_OUTPUT_BYTES) chunks.push(chunk);
+      });
+      const done = () => {
+        clearTimeout(timer);
+        if (children.get(requestID) === child) children.delete(requestID);
+      };
+      child.on("error", done);
+      child.on("close", () => {
+        const mine = children.get(requestID) === child;
+        done();
+        // A waiter that this file stopped (the prompt was answered) answers nothing.
+        if (!mine) return;
+        try {
+          const out = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          if (out?.reply === "once" || out?.reply === "reject") {
+            onAnswer({ reply: out.reply, message: typeof out.message === "string" && out.message ? out.message : null });
+          }
+        } catch {
+          // No answer: the prompt stays at the terminal.
+        }
+      });
+      child.stdin.on("error", () => {});
+      child.stdin.end(JSON.stringify(payload));
+    },
+    stop(requestID) {
+      const child = children.get(requestID);
+      if (!child) return;
+      children.delete(requestID);
+      child.kill();
+    },
+    stopAll() {
+      for (const id of Array.from(children.keys())) this.stop(id);
+    },
+  };
+}
+
+/**
+ * Answer one prompt of opencode out of band, with the owner's `once` or
+ * `reject`. NEVER `always`. The V1 client's
+ * `postSessionIdPermissionsPermissionId` (`POST
+ * /session/:id/permissions/:permissionID`, which opencode 1.18.14 serves)
+ * takes `response` only, so a deny note does not reach opencode there; a
+ * client with the newer `permission.reply` carries it as `message`. Answers
+ * whether opencode took it.
+ */
+async function replyPermission(client, sessionID, requestID, reply, message) {
+  try {
+    if (typeof client?.permission?.reply === "function") {
+      return !refused(await client.permission.reply(message ? { requestID, reply, message } : { requestID, reply }));
+    }
+    if (typeof client?.postSessionIdPermissionsPermissionId === "function") {
+      return !refused(await client.postSessionIdPermissionsPermissionId({ path: { id: sessionID, permissionID: requestID }, body: { response: reply } }));
+    }
+  } catch {
+    // Refused: the prompt stays at the terminal.
+  }
+  return false;
+}
+
 const idOf = (value) => (typeof value === "string" && value.length > 0 && value.length <= 200 ? value : null);
 
 /**
@@ -206,6 +334,25 @@ async function server({ client, directory }) {
       if (!(await deliver(sessionID, cwd, out, prompt))) bells.start(sessionID);
     }
   });
+  const asks = waiters();
+  // The owner's own `reject` in flight, by session: `{ own, until }` (`CASCADE_WINDOW_MS`).
+  const rejecting = new Map();
+  const cascadeOf = (sessionID, requestID) => {
+    const sent = rejecting.get(sessionID);
+    if (!sent) return false;
+    if (Date.now() > sent.until) {
+      rejecting.delete(sessionID);
+      return false;
+    }
+    return sent.own !== requestID;
+  };
+  /** Hand the owner's answer to opencode, and tell the bridge when opencode did not take it. */
+  const answerOut = async (sessionID, requestID, answer) => {
+    if (answer.reply === "reject") rejecting.set(sessionID, { own: requestID, until: Number.POSITIVE_INFINITY });
+    const ok = await replyPermission(client, sessionID, requestID, answer.reply, answer.message).catch(() => false);
+    if (answer.reply === "reject") rejecting.set(sessionID, { own: requestID, until: Date.now() + CASCADE_WINDOW_MS });
+    if (!ok) await callBridge("reply_refused", { sessionID, cwd, requestID });
+  };
   return {
     event: async ({ event }) => {
       try {
@@ -230,11 +377,48 @@ async function server({ client, directory }) {
           bells.start(id);
         } else if (event?.type === "permission.updated" || event?.type === "permission.asked") {
           const id = idOf(props.sessionID);
-          if (id) await callBridge("permission", { sessionID: id, cwd, tool: props.type ?? props.permission ?? null });
+          if (!id) return;
+          const tool = props.type ?? props.permission ?? null;
+          const requestID = idOf(props.id);
+          if (answersHere() && requestID) {
+            // One waiter per prompt, by opencode's id (both events can come
+            // for one prompt): it holds the input on its stdin and answers
+            // `{ reply }` when the owner does. Not awaited: opencode's bus
+            // never waits for the owner.
+            asks.start(
+              requestID,
+              {
+                sessionID: id,
+                cwd,
+                tool,
+                requestID,
+                answer: true,
+                permission: props.permission ?? props.type ?? null,
+                patterns: props.patterns ?? props.pattern ?? null,
+                metadata: props.metadata ?? null,
+              },
+              (answer) => {
+                answerOut(id, requestID, answer).catch(() => {});
+              },
+            );
+          } else {
+            await callBridge("permission", { sessionID: id, cwd, tool });
+          }
         } else if (event?.type === "permission.replied") {
-          // The user answered the prompt: the wait is over, exactly.
+          // The prompt was answered: the wait is over, exactly. The bridge
+          // closes its request first (as answered at the terminal, or nothing
+          // for the echo of this file's own reply), then the waiter stops, so
+          // the waiter's guard never reads the stop as a lost waiter.
           const id = idOf(props.sessionID);
-          if (id) await callBridge("permission_replied", { sessionID: id, cwd });
+          const requestID = idOf(props.requestID ?? props.permissionID);
+          // opencode 1.18.14 names the answer `reply`; an older one, `response`.
+          const reply = props.reply ?? props.response ?? null;
+          const bySession = Boolean(id && requestID && reply === "reject" && cascadeOf(id, requestID));
+          if (id) {
+            const payload = requestID ? { sessionID: id, cwd, requestID } : { sessionID: id, cwd };
+            await callBridge("permission_replied", bySession ? { ...payload, by: "session" } : payload);
+          }
+          if (requestID) asks.stop(requestID);
         } else if (event?.type === "session.deleted") {
           const id = idOf(props.info?.id);
           if (!id) return;
@@ -250,7 +434,11 @@ async function server({ client, directory }) {
       const id = idOf(input?.sessionID);
       if (id) await callBridge("prompt", { sessionID: id, cwd });
     },
-    dispose: async () => bells.stopAll(),
+    dispose: async () => {
+      bells.stopAll();
+      // A stopped waiter's guard closes its request as one that PasserJack can no longer answer.
+      asks.stopAll();
+    },
   };
 }
 
