@@ -11,7 +11,7 @@
       "name": "passerjack",
       "source": "./plugins/passerjack",
       "description": "Watch PasserJack for the whole session: tagged items and messages wake the session as they arrive, the Agents page sees when it waits for you, and you can answer its permission prompts there.",
-      "version": "0.4.0"
+      "version": "0.4.1"
     }
   ]
 }

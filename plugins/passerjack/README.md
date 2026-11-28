@@ -87,6 +87,14 @@ No setting moves this file. A project's Claude Code settings can set
 environment variables, so a setting that moved the file would let a project
 put your sign-in inside itself.
 
+The file is the plugin's own sign-in. A browser sign-in asks for `read` and
+nothing more, so a write with it is refused. A pasted key keeps the scopes you
+gave it. The file's first line, `purpose`, says that it is not for other
+programs or agents: an agent connects with its own PasserJack connection (the
+MCP tools). To
+put a secret that is a file in the Vault, an agent uses `create_upload_link`
+with `target: "vault"`, which keeps the secret out of its context.
+
 Every Claude Code session on the computer uses the same file. The watcher
 renews the sign-in before it expires. When several sessions renew at the same
 time, a lock lets only one of them renew, and the others read its result. The

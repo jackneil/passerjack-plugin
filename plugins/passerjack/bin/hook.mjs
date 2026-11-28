@@ -51,7 +51,7 @@ import { notClaudeCode } from "./hook-core.mjs";
 import { trace as traceTo, TRACE_SWITCHES } from "./trace.mjs";
 import { originAllowed } from "./watch-core.mjs";
 
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 
 /** The events `hooks/hooks.json` runs this file for. */
 const EVENTS = new Set(["stop", "permission", "idle", "tool", "prompt", "start", "request"]);

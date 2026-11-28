@@ -1,6 +1,6 @@
 {
   "name": "passerjack",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Watch PasserJack for the whole session: items you tag for Claude, messages for this agent and the owner's words from the Agents page wake the session as they arrive, the Agents page sees when this session waits for you, and you can answer its permission prompts there.",
   "author": {
     "name": "Jack Neil"

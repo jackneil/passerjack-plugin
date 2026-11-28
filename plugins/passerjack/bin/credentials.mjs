@@ -169,6 +169,19 @@ export function readCredentials(file) {
 }
 
 /**
+ * The first field of every credentials file this plugin writes (#821i): what
+ * the file is, for a person or an agent that finds it on disk. An agent once
+ * took this file's read-only token to a write door because nothing said whose
+ * it was. `parseCredential` drops it like any other unknown field, so an older
+ * plugin reads a file that carries it, and a refresh by an older plugin only
+ * loses it until the next write by this one.
+ */
+export const CREDENTIALS_PURPOSE =
+  "The PasserJack Claude Code plugin's own sign-in, for its watcher and hooks. " +
+  "It is not for other programs or agents: an agent connects with its own PasserJack connection " +
+  "(Settings > Agents on passerjack.com). Do not read, copy or send this token.";
+
+/**
  * Write `cred` to `file` atomically: a temporary file beside it, then a
  * rename, so a reader sees the old file or the new one and never half of one.
  * Throws on failure, because a caller that believes it saved a sign-in must
@@ -181,7 +194,7 @@ export function readCredentials(file) {
 export function writeCredentials(file, cred, platform = process.platform) {
   const parsed = parseCredential(cred);
   if (!parsed) throw new Error("not a credential");
-  writeJsonAtomic(file, parsed, { platform, indent: 2 });
+  writeJsonAtomic(file, { purpose: CREDENTIALS_PURPOSE, ...parsed }, { platform, indent: 2 });
   return parsed;
 }
 

@@ -540,7 +540,7 @@ async function signIn(ctx, origin, file) {
         const error = params.get("error");
         const code = params.get("code");
         if (error || !code) {
-          page(res, 200, "PasserJack did not connect", "The sign-in was not approved. You can close this tab.");
+          page(res, 200, "PasserJack did not connect", "The sign-in did not finish. You can close this tab.");
           resolve({ kind: "denied", error: oneLine(error, 40) ?? "no code" });
           return;
         }
@@ -571,7 +571,7 @@ async function signIn(ctx, origin, file) {
       );
       return 1;
     }
-    if (outcome.kind === "denied") return failed(ctx, `the sign-in was not approved (${outcome.error})`);
+    if (outcome.kind === "denied") return failed(ctx, `the sign-in did not finish (${outcome.error})`);
     if (outcome.kind === "exchange-failed") {
       return failed(ctx, `the server did not accept the sign-in code (${outcome.status || "no answer"})`);
     }

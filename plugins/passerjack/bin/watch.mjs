@@ -107,7 +107,7 @@ import {
   sessionIdFrom,
 } from "./watch-core.mjs";
 
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 
 /**
  * Where this watcher tells the plugin's hooks which session it holds
